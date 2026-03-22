@@ -34,3 +34,17 @@ func (c *Client) CancelOrder(ctx context.Context, orderID string) error {
 	// TODO: DELETE clob_base_url/order/orderID (authenticated)
 	return nil
 }
+
+// ResolvedMarket holds the Gamma API response fields needed for trading.
+type ResolvedMarket struct {
+	Slug         string
+	Question     string
+	ConditionID  string
+	ClobTokenIDs [2]string // [YES, NO]
+}
+
+func (c *Client) ResolveMarket(ctx context.Context, slug string) (*ResolvedMarket, error) {
+	// TODO: GET gamma_base_url/markets?slug=slug
+	// Parse response to extract conditionId and clobTokenIds
+	return nil, nil
+}

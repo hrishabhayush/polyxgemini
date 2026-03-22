@@ -7,11 +7,12 @@ type Config struct {
 }
 
 type PolymarketConfig struct {
-	CLOBBaseURL  string `yaml:"clob_base_url"`
-	GammaBaseURL string `yaml:"gamma_base_url"`
-	WSURL        string `yaml:"ws_url"`
-	APIKey       string `yaml:"api_key"`
-	APISecret    string `yaml:"api_secret"`
+	CLOBBaseURL   string `yaml:"clob_base_url"`
+	GammaBaseURL  string `yaml:"gamma_base_url"`
+	WSURL         string `yaml:"ws_url"`
+	WatchlistPath string `yaml:"watchlist_path"`
+	APIKey        string `yaml:"api_key"`
+	APISecret     string `yaml:"api_secret"`
 }
 
 type GeminiConfig struct {
@@ -32,5 +33,18 @@ type EngineConfig struct {
 
 func Load(path string) (*Config, error) {
 	// TODO: Read YAML file, unmarshal into Config
+	return nil, nil
+}
+
+type MarketEntry struct {
+	Slug string `yaml:"slug"`
+}
+
+type Watchlist struct {
+	Markets []MarketEntry `yaml:"markets"`
+}
+
+func LoadWatchlist(path string) (*Watchlist, error) {
+	// TODO: Read markets YAML file, unmarshal into Watchlist
 	return nil, nil
 }

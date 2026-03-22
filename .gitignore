@@ -5,6 +5,7 @@ bin/
 
 # Config with secrets
 config/config.yaml
+config/markets.yaml
 
 # OS
 .DS_Store
