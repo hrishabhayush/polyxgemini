@@ -1,0 +1,15 @@
+# Binaries
+bin/
+*.exe
+*.out
+
+# Config with secrets
+config/config.yaml
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp

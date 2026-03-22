@@ -1,0 +1,20 @@
+polymarket:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/"
+  api_key: ""
+  api_secret: ""
+
+gemini:
+  base_url: "https://api.gemini.com/v1/prediction-markets"
+  ws_url: "wss://ws.gemini.com"
+  sandbox_url: "https://api.sandbox.gemini.com/v1/prediction-markets"
+  api_key: ""
+  api_secret: ""
+  use_sandbox: true
+
+engine:
+  poll_interval_ms: 1000
+  min_spread_bps: 50
+  max_position_usd: 1000.0
+  dry_run: true
