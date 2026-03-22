@@ -19,3 +19,19 @@ engine:
   min_spread_bps: 50
   max_position_usd: 1000.0
   dry_run: true
+
+sentiment:
+  newsapi_key: ""
+  newsapi_base_url: "https://newsapi.org/v2"
+  gdelt_base_url: "https://api.gdeltproject.org/api/v2/doc/doc"
+  reddit_base_url: "https://www.reddit.com"
+  reddit_user_agent: "sentimentbot/1.0"
+  reddit_client_id: ""
+  reddit_client_secret: ""
+  reddit_subreddits:
+    - "politics"
+    - "worldnews"
+    - "news"
+    - "PredictionMarkets"
+  finbert_server_url: "http://localhost:8765"
+  poll_interval_sec: 150
