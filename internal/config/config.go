@@ -1,5 +1,11 @@
 package config
 
+import (
+	"os"
+
+	"gopkg.in/yaml.v3"
+)
+
 type Config struct {
 	Polymarket PolymarketConfig `yaml:"polymarket"`
 	Gemini     GeminiConfig     `yaml:"gemini"`
@@ -32,8 +38,15 @@ type EngineConfig struct {
 }
 
 func Load(path string) (*Config, error) {
-	// TODO: Read YAML file, unmarshal into Config
-	return nil, nil
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }
 
 type MarketEntry struct {
@@ -45,6 +58,13 @@ type Watchlist struct {
 }
 
 func LoadWatchlist(path string) (*Watchlist, error) {
-	// TODO: Read markets YAML file, unmarshal into Watchlist
-	return nil, nil
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var wl Watchlist
+	if err := yaml.Unmarshal(data, &wl); err != nil {
+		return nil, err
+	}
+	return &wl, nil
 }
