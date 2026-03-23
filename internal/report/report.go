@@ -41,6 +41,16 @@ type MarketReport struct {
 	VolRatio     float64 // current 7-bar variance / historical variance
 	JumpResult   string
 
+	// WebSocket real-time data (from CLOB WebSocket)
+	WSMidPrice     float64 // (best_bid + best_ask) / 2 from PriceChanges
+	WSBidAskSpread float64 // best_ask - best_bid from AggOrderbook
+	WSOBI          float64 // Order Book Imbalance from AggOrderbook
+	WSBestBid      float64
+	WSBestAsk      float64
+	WSTotalBidSize float64
+	WSTotalAskSize float64
+	WSAvailable    bool
+
 	// Sentiment (from news sources + optional FinBERT NLP)
 	ArticleCount int
 	BullishScore float64
@@ -87,7 +97,7 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 	}
 
 	// 2. Microstructure: fetch and compute from trades
-	trades, err := g.poly.FetchTrades(ctx, market.ConditionID, 200)
+	trades, err := g.poly.FetchTrades(ctx, market.ConditionID, 200) //TODO: make this dynamic
 	if err != nil {
 		return nil, fmt.Errorf("report: fetch trades: %w", err)
 	}
@@ -118,12 +128,22 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 	}
 	// Price history failure is non-fatal: fields stay zero
 
-	// 4. Derive news search keywords from market question
+	// 4. WebSocket real-time data: connect, collect for 5s, compute metrics
+	var wsMetrics *polymarket.WSMetrics
+	var wsErr error
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		wsMetrics, wsErr = polymarket.FetchWSMetrics(*market, 5*time.Second)
+	}()
+
+	// 5. Derive news search keywords from market question
 	newsapiQ, broadQ := newsKeywords(market.Question)
 
-	// 5. Fetch articles from all sources concurrently
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	// 6. Fetch articles from all sources concurrently
 	var allTitles []string
 
 	fetch := func(source string, fn func() ([]string, int)) {
@@ -172,7 +192,19 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 	})
 	wg.Wait()
 
-	// 6. Optional NLP scoring via FinBERT
+	// 7. Populate WebSocket metrics (non-fatal if WS fails)
+	if wsErr == nil && wsMetrics != nil {
+		rpt.WSAvailable = true
+		rpt.WSMidPrice = wsMetrics.MidPrice
+		rpt.WSBidAskSpread = wsMetrics.BidAskSpread
+		rpt.WSOBI = wsMetrics.OBI
+		rpt.WSBestBid = wsMetrics.BestBid
+		rpt.WSBestAsk = wsMetrics.BestAsk
+		rpt.WSTotalBidSize = wsMetrics.TotalBidSize
+		rpt.WSTotalAskSize = wsMetrics.TotalAskSize
+	}
+
+	// 8. Optional NLP scoring via FinBERT
 	if pingErr := g.finbert.Ping(ctx); pingErr == nil {
 		rpt.NLPAvailable = true
 		if len(allTitles) > 0 {
