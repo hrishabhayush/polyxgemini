@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
+	"time"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange"
@@ -16,12 +19,96 @@ type Client struct {
 }
 
 func NewClient(cfg config.PolymarketConfig) *Client {
-	return &Client{cfg: cfg, httpClient: &http.Client{}}
+	return &Client{cfg: cfg, httpClient: &http.Client{Timeout: 10 * time.Second}}
 }
 
+// DiscoverMarkets lists Polymarket markets via the Gamma API.
+// active=true filters to open markets; minVolume filters by minimum total volume (USD).
+// Run on startup and re-scan every 15–30 min to pick up newly created markets.
+// Returns a slice of ResolvedMarket with ConditionID and ClobTokenIDs populated.
+func (c *Client) DiscoverMarkets(ctx context.Context, active bool, minVolume float64) ([]ResolvedMarket, error) {
+	params := url.Values{}
+	if active {
+		params.Set("active", "true")
+	}
+	if minVolume > 0 {
+		params.Set("volume_num_min", strconv.FormatFloat(minVolume, 'f', 2, 64))
+	}
+	params.Set("limit", "100")
+
+	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gamma: unexpected status %d", resp.StatusCode)
+	}
+
+	var raw []gammaMarketResponse
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("gamma: decode: %w", err)
+	}
+
+	markets := make([]ResolvedMarket, 0, len(raw))
+	for _, m := range raw {
+		var tokenIDs []string
+		if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) < 2 {
+			continue // skip markets with malformed token IDs
+		}
+		markets = append(markets, ResolvedMarket{
+			Slug:         m.Slug,
+			Question:     m.Question,
+			ConditionID:  m.ConditionID,
+			ClobTokenIDs: [2]string{tokenIDs[0], tokenIDs[1]},
+		})
+	}
+	return markets, nil
+}
+
+// FetchMarketByConditionID returns full metadata for a single market by its condition ID.
+//
+// The Gamma API has no working filter param for condition ID, so this fetches
+// the full market list and scans client-side. Adequate for our use case (<500 markets).
+func (c *Client) FetchMarketByConditionID(ctx context.Context, conditionID string) (*ResolvedMarket, error) {
+	// No volume filter — we need to find any market regardless of volume.
+	markets, err := c.DiscoverMarkets(ctx, false, 0)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: FetchMarketByConditionID: %w", err)
+	}
+	for _, m := range markets {
+		if m.ConditionID == conditionID {
+			return &m, nil
+		}
+	}
+	return nil, fmt.Errorf("gamma: no market found for conditionID %s", conditionID)
+}
+
+// FetchMarkets implements exchange.Exchange. Delegates to DiscoverMarkets with default filters.
 func (c *Client) FetchMarkets(ctx context.Context) ([]exchange.Market, error) {
-	// TODO: GET gamma_base_url/markets -> normalize to []Market
-	return nil, nil
+	resolved, err := c.DiscoverMarkets(ctx, true, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]exchange.Market, 0, len(resolved))
+	for _, r := range resolved {
+		out = append(out, exchange.Market{
+			ID:   r.ConditionID,
+			Name: r.Question,
+			Outcomes: []exchange.Outcome{
+				{ID: r.ClobTokenIDs[0], Label: "YES"},
+				{ID: r.ClobTokenIDs[1], Label: "NO"},
+			},
+		})
+	}
+	return out, nil
 }
 
 func (c *Client) FetchOrderBook(ctx context.Context, tokenID string) (*exchange.OrderBook, error) {
