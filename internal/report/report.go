@@ -12,6 +12,7 @@ import (
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/polymarket"
 	"github.com/hrishabhayush/polyxgemini/internal/sentiment"
 	"github.com/hrishabhayush/polyxgemini/internal/sentiment/finbert"
+	"github.com/hrishabhayush/polyxgemini/internal/sentiment/gamma"
 	"github.com/hrishabhayush/polyxgemini/internal/sentiment/gdelt"
 	"github.com/hrishabhayush/polyxgemini/internal/sentiment/newsapi"
 	"github.com/hrishabhayush/polyxgemini/internal/sentiment/reddit"
@@ -51,17 +52,30 @@ type MarketReport struct {
 	WSTotalAskSize float64
 	WSAvailable    bool
 
+	// Gamma comments (from Gamma API + FinBERT)
+	GammaCommentCount   int
+	GammaCommentBullish float64
+	GammaCommentBearish float64
+
+	// Resolution source metadata (Tier 1-3 enrichment)
+	ResolutionSource      string
+	ResolutionDomain      string
+	ResolutionReliability float64
+	ResolutionSnippet     string
+	ResolutionEnrichStatus string
+
 	// Sentiment (from news sources + optional FinBERT NLP)
 	ArticleCount int
 	BullishScore float64
 	BearishScore float64
-	SourceCounts map[string]int // {"newsapi": N, "gdelt": N, "reddit": N}
+	SourceCounts map[string]int // {"newsapi": N, "gdelt": N, "reddit": N, "gamma_comments": N}
 	NLPAvailable bool
 }
 
 // Generator orchestrates Polymarket API calls and sentiment fetching for a single market.
 type Generator struct {
 	poly    *polymarket.Client
+	gamma   *gamma.Client
 	news    *newsapi.Client
 	gdelt   *gdelt.Client
 	reddit  *reddit.Client
@@ -72,6 +86,7 @@ type Generator struct {
 func NewGenerator(polyCfg config.PolymarketConfig, sentCfg config.SentimentConfig) *Generator {
 	return &Generator{
 		poly:    polymarket.NewClient(polyCfg),
+		gamma:   gamma.NewClient(polyCfg.GammaBaseURL),
 		news:    newsapi.NewClient(sentCfg),
 		gdelt:   gdelt.NewClient(sentCfg),
 		reddit:  reddit.NewClient(sentCfg),
@@ -128,22 +143,47 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 	}
 	// Price history failure is non-fatal: fields stay zero
 
-	// 4. WebSocket real-time data: connect, collect for 5s, compute metrics
+	// 4. Launch all concurrent fetches: WS, news, gamma comments, resolution enrichment
 	var wsMetrics *polymarket.WSMetrics
 	var wsErr error
+	var gammaComments []gamma.Comment
+	var gammaErr error
+	var resMeta polymarket.SourceMeta
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	// 4a. WebSocket snapshot
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		wsMetrics, wsErr = polymarket.FetchWSMetrics(*market, 5*time.Second)
 	}()
 
+	// 4b. Gamma comments
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		parentID := market.EventID
+		if parentID == 0 {
+			parentID = market.GammaID // fallback for older payload shapes
+		}
+		if parentID > 0 {
+			gammaComments, gammaErr = g.gamma.FetchComments(ctx, parentID, 50)
+		}
+	}()
+
+	// 4c. Resolution source enrichment (Tier 2 inline, Tier 3 async)
+	resMeta = polymarket.ClassifySource(market.ResolutionSource)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		polymarket.EnrichSource(ctx, &resMeta)
+	}()
+
 	// 5. Derive news search keywords from market question
 	newsapiQ, broadQ := newsKeywords(market.Question)
 
-	// 6. Fetch articles from all sources concurrently
+	// 6. Fetch articles from all news sources concurrently
 	var allTitles []string
 
 	fetch := func(source string, fn func() ([]string, int)) {
@@ -204,9 +244,25 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 		rpt.WSTotalAskSize = wsMetrics.TotalAskSize
 	}
 
-	// 8. Optional NLP scoring via FinBERT
+	// 8. Populate Gamma comment metrics
+	if gammaErr == nil && len(gammaComments) > 0 {
+		filtered := gamma.FilterRelevant(gammaComments, 10)
+		rpt.GammaCommentCount = len(filtered)
+		rpt.SourceCounts["gamma_comments"] = len(filtered)
+	}
+
+	// 9. Populate resolution source metadata
+	rpt.ResolutionSource = resMeta.RawSource
+	rpt.ResolutionDomain = resMeta.Domain
+	rpt.ResolutionReliability = resMeta.ReliabilityScore
+	rpt.ResolutionSnippet = resMeta.ExtractedSnippet
+	rpt.ResolutionEnrichStatus = resMeta.EnrichmentStatus
+
+	// 10. Optional NLP scoring via FinBERT (news + gamma comments)
 	if pingErr := g.finbert.Ping(ctx); pingErr == nil {
 		rpt.NLPAvailable = true
+
+		// Score news titles
 		if len(allTitles) > 0 {
 			scores, err := g.finbert.Score(ctx, allTitles)
 			if err == nil {
@@ -218,6 +274,30 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 				sig := agg.Signal(market.ConditionID)
 				rpt.BullishScore = sig.BullishScore
 				rpt.BearishScore = sig.BearishScore
+			}
+		}
+
+		// Score gamma comments with position-based weighting
+		if gammaErr == nil && len(gammaComments) > 0 {
+			filtered := gamma.FilterRelevant(gammaComments, 10)
+			if len(filtered) > 0 {
+				bodies := make([]string, len(filtered))
+				for i, c := range filtered {
+					bodies[i] = c.Body
+				}
+				scores, err := g.finbert.Score(ctx, bodies)
+				if err == nil {
+					agg := sentiment.NewAggregator(len(scores))
+					for i, s := range scores {
+						w := gamma.PositionWeight(filtered[i].PositionSize, 500)
+						s.Score *= w
+						s.Source = "gamma_comment"
+						agg.Add(market.ConditionID, s)
+					}
+					sig := agg.Signal(market.ConditionID)
+					rpt.GammaCommentBullish = sig.BullishScore
+					rpt.GammaCommentBearish = sig.BearishScore
+				}
 			}
 		}
 	}

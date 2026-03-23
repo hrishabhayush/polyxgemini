@@ -22,6 +22,28 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// gammaID handles Gamma market IDs that may arrive as either
+// JSON numbers or JSON strings.
+type gammaID int
+
+func (g *gammaID) UnmarshalJSON(data []byte) error {
+	s := strings.TrimSpace(string(data))
+	if s == "null" || s == "" {
+		*g = 0
+		return nil
+	}
+	// String form: "12345"
+	if strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
+		s = strings.Trim(s, "\"")
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("gamma id parse: %w", err)
+	}
+	*g = gammaID(v)
+	return nil
+}
+
 func NewClient(cfg config.PolymarketConfig) *Client {
 	return &Client{cfg: cfg, httpClient: &http.Client{Timeout: 10 * time.Second}}
 }
@@ -73,10 +95,14 @@ func (c *Client) discoverWithLimit(ctx context.Context, active bool, minVolume f
 			continue // skip markets with malformed token IDs
 		}
 		markets = append(markets, ResolvedMarket{
-			Slug:         m.Slug,
-			Question:     m.Question,
-			ConditionID:  m.ConditionID,
-			ClobTokenIDs: [2]string{tokenIDs[0], tokenIDs[1]},
+			Slug:             m.Slug,
+			Question:         m.Question,
+			ConditionID:      m.ConditionID,
+			ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
+			GammaID:          int(m.ID),
+			EventID:          firstEventID(m.Events),
+			ResolutionSource: m.ResolutionSource,
+			Description:      m.Description,
 		})
 	}
 	return markets, nil
@@ -137,10 +163,14 @@ func (c *Client) FindMarket(ctx context.Context, query string) (*ResolvedMarket,
 				continue
 			}
 			return &ResolvedMarket{
-				Slug:         m.Slug,
-				Question:     m.Question,
-				ConditionID:  m.ConditionID,
-				ClobTokenIDs: [2]string{tokenIDs[0], tokenIDs[1]},
+				Slug:             m.Slug,
+				Question:         m.Question,
+				ConditionID:      m.ConditionID,
+				ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
+				GammaID:          int(m.ID),
+				EventID:          firstEventID(m.Events),
+				ResolutionSource: m.ResolutionSource,
+				Description:      m.Description,
 			}, nil
 		}
 	}
@@ -235,19 +265,31 @@ func (c *Client) CancelOrder(ctx context.Context, orderID string) error {
 
 // ResolvedMarket holds the Gamma API response fields needed for trading.
 type ResolvedMarket struct {
-	Slug         string
-	Question     string
-	ConditionID  string
-	ClobTokenIDs [2]string // [YES, NO]
+	Slug             string
+	Question         string
+	ConditionID      string
+	ClobTokenIDs     [2]string // [YES, NO]
+	GammaID          int       // numeric Gamma market ID (used for comments endpoint)
+	EventID          int       // Gamma event ID (comments parent_entity_id for Event threads)
+	ResolutionSource string    // URL or text describing how the market resolves
+	Description      string    // full market description / rules
 }
 
 // gammaMarketResponse is the raw Gamma API response for a single market.
 // Note: clobTokenIds comes back as a JSON-encoded string, not a native array.
 type gammaMarketResponse struct {
-	Slug         string `json:"slug"`
-	Question     string `json:"question"`
-	ConditionID  string `json:"conditionId"`
-	ClobTokenIDs string `json:"clobTokenIds"`
+	ID               gammaID `json:"id"`
+	Slug             string `json:"slug"`
+	Question         string `json:"question"`
+	ConditionID      string `json:"conditionId"`
+	ClobTokenIDs     string `json:"clobTokenIds"`
+	Events           []gammaEvent `json:"events"`
+	ResolutionSource string `json:"resolutionSource"`
+	Description      string `json:"description"`
+}
+
+type gammaEvent struct {
+	ID gammaID `json:"id"`
 }
 
 // ResolveMarket looks up a market by slug via the Gamma API and returns its token IDs.
@@ -290,9 +332,20 @@ func (c *Client) ResolveMarket(ctx context.Context, slug string) (*ResolvedMarke
 	}
 
 	return &ResolvedMarket{
-		Slug:         m.Slug,
-		Question:     m.Question,
-		ConditionID:  m.ConditionID,
-		ClobTokenIDs: [2]string{tokenIDs[0], tokenIDs[1]},
+		Slug:             m.Slug,
+		Question:         m.Question,
+		ConditionID:      m.ConditionID,
+		ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
+		GammaID:          int(m.ID),
+		EventID:          firstEventID(m.Events),
+		ResolutionSource: m.ResolutionSource,
+		Description:      m.Description,
 	}, nil
+}
+
+func firstEventID(events []gammaEvent) int {
+	if len(events) == 0 {
+		return 0
+	}
+	return int(events[0].ID)
 }

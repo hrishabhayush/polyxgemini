@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	defaultMarket      = "cs2-prv-vit-2026-03-23"
+	defaultMarket      = "cs2-nem-k271-2026-03-23"
 	defaultFinBERTURL  = "http://localhost:8765"
 	defaultNewsAPIBase = "https://newsapi.org/v2"
 	defaultGDELTBase   = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -232,19 +232,44 @@ func printReport(t *testing.T, rpt *report.MarketReport) {
 			rpt.WSTotalBidSize, rpt.WSTotalAskSize)
 	}
 
+	// Gamma comments
+	fmt.Printf("%s\n", thin)
+	fmt.Printf("  GAMMA COMMENTS\n")
+	fmt.Printf("%s\n", thin)
+	if rpt.GammaCommentCount == 0 {
+		fmt.Printf("  (no relevant comments found)\n")
+	} else if !rpt.NLPAvailable {
+		fmt.Printf("  %-24s %d (NLP unavailable — scores pending)\n",
+			"Relevant comments", rpt.GammaCommentCount)
+	} else {
+		fmt.Printf("  %-24s %d\n", "Relevant comments", rpt.GammaCommentCount)
+		fmt.Printf("  %-24s %.4f\n", "Bullish (weighted)", rpt.GammaCommentBullish)
+		fmt.Printf("  %-24s %.4f\n", "Bearish (weighted)", rpt.GammaCommentBearish)
+		gcNet := rpt.GammaCommentBullish - rpt.GammaCommentBearish
+		gcDir := "NEUTRAL"
+		if gcNet > 0.1 {
+			gcDir = "BULLISH"
+		} else if gcNet < -0.1 {
+			gcDir = "BEARISH"
+		}
+		fmt.Printf("  %-24s %-12s %s\n", "Net signal",
+			fmt.Sprintf("%+.4f", gcNet), gcDir)
+	}
+
 	// Sentiment
 	fmt.Printf("%s\n", thin)
 	newsapiN := rpt.SourceCounts["newsapi"]
 	gdeltN := rpt.SourceCounts["gdelt"]
 	redditN := rpt.SourceCounts["reddit"]
+	gammaCommN := rpt.SourceCounts["gamma_comments"]
 	fmt.Printf("  NEWS SENTIMENT  (%d articles, last 7d)\n", rpt.ArticleCount)
 	fmt.Printf("%s\n", thin)
 	if rpt.ArticleCount == 0 {
 		fmt.Printf("  (no articles found)\n")
 	} else if !rpt.NLPAvailable {
 		fmt.Printf("  NLP scoring unavailable — start FinBERT server for scores\n")
-		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)\n",
-			"Sources", newsapiN, gdeltN, redditN)
+		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)  Gamma(%-3d)\n",
+			"Sources", newsapiN, gdeltN, redditN, gammaCommN)
 	} else {
 		net := rpt.BullishScore - rpt.BearishScore
 		netDir := "NEUTRAL"
@@ -257,8 +282,37 @@ func printReport(t *testing.T, rpt *report.MarketReport) {
 		fmt.Printf("  %-24s %.4f\n", "Bearish", rpt.BearishScore)
 		fmt.Printf("  %-24s %-12s %s\n", "Net signal",
 			fmt.Sprintf("%+.4f", net), netDir)
-		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)\n",
-			"Sources", newsapiN, gdeltN, redditN)
+		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)  Gamma(%-3d)\n",
+			"Sources", newsapiN, gdeltN, redditN, gammaCommN)
+	}
+
+	// Resolution source
+	fmt.Printf("%s\n", thin)
+	fmt.Printf("  RESOLUTION SOURCE\n")
+	fmt.Printf("%s\n", thin)
+	if rpt.ResolutionSource == "" {
+		fmt.Printf("  (no resolution source specified)\n")
+	} else {
+		src := rpt.ResolutionSource
+		if len(src) > 60 {
+			src = src[:60] + "..."
+		}
+		fmt.Printf("  %-24s %s\n", "Source", src)
+		if rpt.ResolutionDomain != "" {
+			fmt.Printf("  %-24s %s\n", "Domain", rpt.ResolutionDomain)
+		}
+		fmt.Printf("  %-24s %-12s %s\n", "Reliability",
+			fmt.Sprintf("%.2f", rpt.ResolutionReliability),
+			reliabilityNote(rpt.ResolutionReliability))
+		fmt.Printf("  %-24s %s\n", "Enrichment",
+			enrichNote(rpt.ResolutionEnrichStatus))
+		if rpt.ResolutionSnippet != "" {
+			snippet := rpt.ResolutionSnippet
+			if len(snippet) > 120 {
+				snippet = snippet[:120] + "..."
+			}
+			fmt.Printf("  %-24s %s\n", "Snippet", snippet)
+		}
 	}
 
 	fmt.Printf("%s\n\n", sep)
@@ -363,5 +417,41 @@ func obiNote(obi float64) string {
 		return "mild sell pressure"
 	default:
 		return "balanced book"
+	}
+}
+
+func reliabilityNote(score float64) string {
+	switch {
+	case score >= 0.85:
+		return "HIGH — trusted official source"
+	case score >= 0.70:
+		return "good — major outlet"
+	case score >= 0.50:
+		return "moderate — reputable"
+	case score >= 0.20:
+		return "LOW — unknown domain"
+	default:
+		return "none — no resolution source"
+	}
+}
+
+func enrichNote(status string) string {
+	switch status {
+	case "ok":
+		return "fetched successfully"
+	case "classified":
+		return "domain classified (not yet fetched)"
+	case "not_url":
+		return "text-only source (not a URL)"
+	case "no_source":
+		return "no resolution source provided"
+	case "timeout":
+		return "unavailable — request timed out"
+	case "non_html":
+		return "unavailable — non-HTML content"
+	case "unavailable":
+		return "unavailable — could not reach source"
+	default:
+		return status
 	}
 }

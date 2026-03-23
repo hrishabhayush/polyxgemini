@@ -6,7 +6,14 @@
   go test ./internal/exchange/polymarket/polymarket_test/... -v -run TestDataTrades     -timeout 30s | cat                                 
   go test ./internal/exchange/polymarket/polymarket_test/... -v -run TestDataPositions  -timeout 30s | cat                                 
   go test ./internal/exchange/polymarket/polymarket_test/... -v -run TestDataPrices     -timeout 30s | cat                                 
-                                                                                                                                           
+
+                 
+
+  resolution:
+  go test ./internal/exchange/polymarket/polymarket_test/... -run "TestClassifySource|TestDomainReliabilityScore" -v                                                                                                                          
+
+  go test ./internal/exchange/polymarket/polymarket_test/... -run 'TestEnrichSourceLive|TestResolutionSourceFromMarket' -v
+  
   ▎ The | cat at the end is needed on macOS — without it, go test swallows fmt.Printf output when tests pass.                              
                                                                                                                                            
   Three env vars to override for any test:
