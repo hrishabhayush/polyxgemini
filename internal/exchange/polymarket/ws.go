@@ -75,7 +75,7 @@ func (w *WSClient) Connect() error {
 				}
 			}
 			cents := bestAsk.Mul(decimal.NewFromInt(100))
-			log.Printf("[book] %-40s | buy @ %s¢ | asks: %d levels",
+			log.Printf("[POLY book]  %-40s | buy @ %s¢ | asks: %d levels",
 				w.label(ob.AssetID), cents.StringFixed(1), len(ob.Asks))
 			return nil
 		},
@@ -93,7 +93,7 @@ func (w *WSClient) Connect() error {
 			}
 			for _, c := range pc.PriceChange {
 				askCents := c.BestAsk.Mul(decimal.NewFromInt(100))
-				log.Printf("[price] %-40s | buy @ %s¢",
+				log.Printf("[POLY price] %-40s | buy @ %s¢",
 					w.label(c.AssetID), askCents.StringFixed(1))
 			}
 			return nil

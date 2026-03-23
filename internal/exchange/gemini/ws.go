@@ -115,7 +115,7 @@ func (w *WSClient) readLoop() {
 			continue
 		}
 
-		log.Printf("[gemini] %-40s | buy @ %s¢ | ask_qty: %s",
+		log.Printf("[GEMI book]  %-40s | buy @ %s¢ | ask_qty: %s",
 			w.label(bt.Symbol), centsFromDecimal(bt.BestAsk), bt.AskQty)
 	}
 }
