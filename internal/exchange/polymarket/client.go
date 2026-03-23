@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange"
 )
+
+var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
 
 type Client struct {
 	cfg        config.PolymarketConfig
@@ -27,6 +31,11 @@ func NewClient(cfg config.PolymarketConfig) *Client {
 // Run on startup and re-scan every 15–30 min to pick up newly created markets.
 // Returns a slice of ResolvedMarket with ConditionID and ClobTokenIDs populated.
 func (c *Client) DiscoverMarkets(ctx context.Context, active bool, minVolume float64) ([]ResolvedMarket, error) {
+	return c.discoverWithLimit(ctx, active, minVolume, 100)
+}
+
+// discoverWithLimit is the shared implementation for Gamma market list fetching.
+func (c *Client) discoverWithLimit(ctx context.Context, active bool, minVolume float64, limit int) ([]ResolvedMarket, error) {
 	params := url.Values{}
 	if active {
 		params.Set("active", "true")
@@ -34,7 +43,7 @@ func (c *Client) DiscoverMarkets(ctx context.Context, active bool, minVolume flo
 	if minVolume > 0 {
 		params.Set("volume_num_min", strconv.FormatFloat(minVolume, 'f', 2, 64))
 	}
-	params.Set("limit", "100")
+	params.Set("limit", strconv.Itoa(limit))
 
 	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -71,6 +80,104 @@ func (c *Client) DiscoverMarkets(ctx context.Context, active bool, minVolume flo
 		})
 	}
 	return markets, nil
+}
+
+// FindMarket searches active markets for the first case-insensitive substring match
+// on Question or Slug. Scans up to 500 markets sorted by 24-hour volume (highest
+// first) so that current, liquid markets are found before stale/historical ones.
+// Intended for test/report use — not for high-frequency polling.
+func (c *Client) FindMarket(ctx context.Context, query string) (*ResolvedMarket, error) {
+	// First try direct slug resolution for deterministic lookup.
+	// Handles raw slug input and full Polymarket event URLs.
+	if slug := queryToSlug(query); slug != "" {
+		if m, err := c.ResolveMarket(ctx, slug); err == nil {
+			return m, nil
+		}
+	}
+
+	params := url.Values{}
+	params.Set("active", "true")
+	params.Set("limit", "500")
+	params.Set("order", "volume24hr")
+	params.Set("ascending", "false")
+
+	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: FindMarket: build request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: FindMarket: request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gamma: FindMarket: status %d", resp.StatusCode)
+	}
+	var raw []gammaMarketResponse
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("gamma: FindMarket: decode: %w", err)
+	}
+
+	qRaw := strings.ToLower(strings.TrimSpace(query))
+	qNorm := normalizeSearchText(query)
+	for _, m := range raw {
+		questionLower := strings.ToLower(m.Question)
+		slugLower := strings.ToLower(m.Slug)
+		questionNorm := normalizeSearchText(m.Question)
+		slugNorm := normalizeSearchText(m.Slug)
+
+		if strings.Contains(questionLower, qRaw) ||
+			strings.Contains(slugLower, qRaw) ||
+			(qNorm != "" && (strings.Contains(questionNorm, qNorm) ||
+				strings.Contains(qNorm, questionNorm) ||
+				strings.Contains(slugNorm, qNorm))) {
+			var tokenIDs []string
+			if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) < 2 {
+				continue
+			}
+			return &ResolvedMarket{
+				Slug:         m.Slug,
+				Question:     m.Question,
+				ConditionID:  m.ConditionID,
+				ClobTokenIDs: [2]string{tokenIDs[0], tokenIDs[1]},
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("polymarket: no active market matching %q", query)
+}
+
+func queryToSlug(query string) string {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return ""
+	}
+	if strings.Contains(q, "/event/") {
+		parts := strings.Split(q, "/event/")
+		if len(parts) < 2 {
+			return ""
+		}
+		tail := strings.Trim(parts[1], "/")
+		if tail == "" {
+			return ""
+		}
+		seg := strings.Split(tail, "/")
+		if len(seg) == 0 {
+			return ""
+		}
+		return strings.ToLower(strings.TrimSpace(seg[0]))
+	}
+	// Treat single-token kebab-case input as slug.
+	if strings.Contains(q, "-") && !strings.Contains(q, " ") {
+		return strings.ToLower(q)
+	}
+	return ""
+}
+
+func normalizeSearchText(s string) string {
+	out := strings.ToLower(strings.TrimSpace(s))
+	out = nonAlnum.ReplaceAllString(out, " ")
+	return strings.TrimSpace(strings.Join(strings.Fields(out), " "))
 }
 
 // FetchMarketByConditionID returns full metadata for a single market by its condition ID.

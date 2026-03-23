@@ -5,3 +5,5 @@ go test -v -tags=integration ./internal/sentiment/reddit/
 
 make finbert-server
 go test -v -tags=integration ./internal/sentiment/finbert/
+
+
