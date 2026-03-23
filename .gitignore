@@ -17,3 +17,5 @@ config/markets.yaml
 
 #docs
 docs/
+
+.env
