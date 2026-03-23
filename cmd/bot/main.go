@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
+	"github.com/hrishabhayush/polyxgemini/internal/exchange/gemini"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/polymarket"
 )
 
@@ -28,35 +29,65 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load watchlist: %v", err)
 	}
-	log.Printf("watchlist loaded: %d markets", len(wl.Markets))
+	log.Printf("watchlist loaded: %d polymarket, %d gemini markets",
+		len(wl.Markets), len(wl.GeminiMarkets))
 
-	// Resolve slugs to token IDs via Gamma API
 	ctx := context.Background()
-	polyClient := polymarket.NewClient(cfg.Polymarket)
 
-	var resolved []polymarket.ResolvedMarket
+	// --- Polymarket ---
+	polyClient := polymarket.NewClient(cfg.Polymarket)
+	var polyResolved []polymarket.ResolvedMarket
 	for _, entry := range wl.Markets {
 		m, err := polyClient.ResolveMarket(ctx, entry.Slug)
 		if err != nil {
-			log.Printf("WARN: failed to resolve market %q: %v", entry.Slug, err)
+			log.Printf("WARN: failed to resolve polymarket %q: %v", entry.Slug, err)
 			continue
 		}
-		log.Printf("resolved %q -> %s", m.Question, m.Slug)
-		resolved = append(resolved, *m)
+		log.Printf("[poly] resolved %q -> %s", m.Question, m.Slug)
+		polyResolved = append(polyResolved, *m)
 	}
 
-	if len(resolved) == 0 {
-		log.Fatal("no markets resolved, nothing to subscribe to")
+	if len(polyResolved) > 0 {
+		polyWS := polymarket.NewWSClient(polyResolved)
+		if err := polyWS.Connect(); err != nil {
+			log.Printf("WARN: polymarket ws failed: %v", err)
+		} else {
+			defer polyWS.Close()
+			log.Printf("[poly] subscribed to %d markets", len(polyResolved))
+		}
 	}
 
-	// Connect WebSocket and subscribe
-	ws := polymarket.NewWSClient(resolved)
-	if err := ws.Connect(); err != nil {
-		log.Fatalf("failed to connect polymarket ws: %v", err)
+	// --- Gemini ---
+	geminiClient := gemini.NewClient(cfg.Gemini)
+	var geminiResolved []gemini.ResolvedEvent
+	for _, entry := range wl.GeminiMarkets {
+		e, err := geminiClient.ResolveEvent(ctx, entry.Ticker)
+		if err != nil {
+			log.Printf("WARN: failed to resolve gemini %q: %v", entry.Ticker, err)
+			continue
+		}
+		log.Printf("[gemi] resolved %q -> %d contracts", e.Title, len(e.Contracts))
+		for _, c := range e.Contracts {
+			log.Printf("[gemi]   %s (%s) ask=%s¢", c.Label, c.InstrumentSymbol, c.BestAsk)
+		}
+		geminiResolved = append(geminiResolved, *e)
 	}
-	defer ws.Close()
 
-	log.Printf("subscribed to %d markets, listening for updates...", len(resolved))
+	if len(geminiResolved) > 0 {
+		geminiWS := gemini.NewWSClient(cfg.Gemini.WSURL, geminiResolved)
+		if err := geminiWS.Connect(); err != nil {
+			log.Printf("WARN: gemini ws failed: %v", err)
+		} else {
+			defer geminiWS.Close()
+			log.Printf("[gemi] subscribed to %d events", len(geminiResolved))
+		}
+	}
+
+	if len(polyResolved) == 0 && len(geminiResolved) == 0 {
+		log.Fatal("no markets resolved on either exchange")
+	}
+
+	log.Println("listening for updates... (Ctrl+C to stop)")
 
 	// Wait for interrupt
 	sig := make(chan os.Signal, 1)

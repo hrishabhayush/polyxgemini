@@ -53,8 +53,13 @@ type MarketEntry struct {
 	Slug string `yaml:"slug"`
 }
 
+type GeminiMarketEntry struct {
+	Ticker string `yaml:"ticker"`
+}
+
 type Watchlist struct {
-	Markets []MarketEntry `yaml:"markets"`
+	Markets       []MarketEntry       `yaml:"markets"`
+	GeminiMarkets []GeminiMarketEntry `yaml:"gemini_markets"`
 }
 
 func LoadWatchlist(path string) (*Watchlist, error) {
