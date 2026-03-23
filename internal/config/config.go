@@ -15,6 +15,7 @@ type Config struct {
 type PolymarketConfig struct {
 	CLOBBaseURL   string `yaml:"clob_base_url"`
 	GammaBaseURL  string `yaml:"gamma_base_url"`
+	DataBaseURL   string `yaml:"data_base_url"`
 	WSURL         string `yaml:"ws_url"`
 	WatchlistPath string `yaml:"watchlist_path"`
 	APIKey        string `yaml:"api_key"`

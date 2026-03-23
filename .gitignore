@@ -14,3 +14,6 @@ config/markets.yaml
 .idea/
 .vscode/
 *.swp
+
+#docs
+docs/
