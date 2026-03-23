@@ -100,7 +100,8 @@ func (c *Client) searchSubreddit(ctx context.Context, keywords, subreddit string
 func (c *Client) buildURL(path, keywords string, limit int, restrictSR bool) string {
 	params := url.Values{}
 	params.Set("q", keywords)
-	params.Set("sort", "new")
+	params.Set("sort", "relevance") // was "new"; recency sort pushes off-topic recent posts
+	params.Set("t", "week")         // only posts from the last 7 days
 	params.Set("limit", strconv.Itoa(limit))
 	if restrictSR {
 		params.Set("restrict_sr", "true")

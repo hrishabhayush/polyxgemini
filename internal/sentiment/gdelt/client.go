@@ -35,14 +35,17 @@ func NewClient(cfg config.SentimentConfig) *Client {
 }
 
 // FetchArticles calls the GDELT doc API in artlist mode.
-// Returns at most maxResults articles sorted by date descending.
+// Returns at most maxResults articles ranked by HybridRel (relevance + recency)
+// within the last 7 days. Pass keywords using GDELT boolean syntax, e.g.
+// `trump AND impeach` or `"trump impeachment"` for tighter matching.
 func (c *Client) FetchArticles(ctx context.Context, keywords string, maxResults int) ([]Article, error) {
 	params := url.Values{}
 	params.Set("query", keywords)
 	params.Set("mode", "artlist")
 	params.Set("format", "json")
 	params.Set("maxrecords", strconv.Itoa(maxResults))
-	params.Set("sort", "DateDesc")
+	params.Set("sort", "HybridRel") // relevance-aware ranking; DateDesc would push off-topic recency
+	params.Set("timespan", "7d")    // limit to last 7 days to avoid stale noise
 
 	endpoint := c.cfg.GDELTBaseURL + "?" + params.Encode()
 

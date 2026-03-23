@@ -33,11 +33,31 @@ USER_AGENT   = "sentimentbot/1.0"
 
 # ── API fetchers ─────────────────────────────────────────────────────────────
 
+def _from_date(days: int = 7) -> str:
+    """Return ISO date string for `days` ago, used to cap NewsAPI results."""
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def fetch_newsapi(query: str, n: int) -> list[dict]:
+    """Fetch from NewsAPI /v2/everything.
+
+    Use boolean syntax in `query` for tight matching, e.g.:
+      - AND:  "trump AND impeach"
+      - phrase: '"trump impeachment"'
+      - exclude: "trump AND impeach NOT satire"
+    sortBy=relevance avoids the recency-only flood of off-topic breaking news.
+    """
     if not NEWSAPI_KEY:
         print("  [SKIP] NEWSAPI_KEY not set — skipping NewsAPI")
         return []
-    params = {"q": query, "sortBy": "publishedAt", "language": "en", "pageSize": n}
+    params = {
+        "q":        query,
+        "sortBy":   "relevance",  # was publishedAt — recency-only buries weak matches
+        "language": "en",
+        "pageSize": n,
+        "from":     _from_date(7),  # last 7 days to avoid stale noise
+    }
     resp = httpx.get(f"{NEWSAPI_BASE}/everything", params=params,
                      headers={"X-Api-Key": NEWSAPI_KEY}, timeout=10)
     resp.raise_for_status()
@@ -55,8 +75,17 @@ def fetch_newsapi(query: str, n: int) -> list[dict]:
 
 
 def fetch_gdelt(query: str, n: int) -> list[dict]:
+    """Fetch from GDELT doc API in artlist mode.
+
+    Use GDELT boolean syntax in `query`, e.g.:
+      - AND (default): "trump impeach"  — space = AND in GDELT
+      - exact phrase:  '"trump impeachment"'
+      - proximity:     "trump near10 impeach"
+    HybridRel balances relevance + recency; DateDesc would flood with off-topic recent articles.
+    timespan=7d caps results to the last 7 days.
+    """
     params = {"query": query, "mode": "artlist", "format": "json",
-              "maxrecords": n, "sort": "DateDesc"}
+              "maxrecords": n, "sort": "HybridRel", "timespan": "7d"}
     resp = httpx.get(GDELT_BASE, params=params, timeout=10)
     resp.raise_for_status()
     articles = resp.json().get("articles") or []
@@ -72,6 +101,12 @@ def fetch_gdelt(query: str, n: int) -> list[dict]:
 
 
 def fetch_reddit(query: str, n: int) -> list[dict]:
+    """Fetch from Reddit per-subreddit search.
+
+    sort=relevance ranks by match quality; sort=new floods with off-topic recent posts.
+    t=week limits to posts from the last 7 days.
+    Reddit supports basic boolean in `query`, e.g.: "trump AND impeach"
+    """
     posts = []
     seen = set()
     per_sub = max(1, n // len(REDDIT_SUBS) + 1)
@@ -79,7 +114,7 @@ def fetch_reddit(query: str, n: int) -> list[dict]:
 
     for sub in REDDIT_SUBS:
         url = f"{REDDIT_BASE}/r/{sub}/search.json"
-        params = {"q": query, "sort": "new", "restrict_sr": "true", "limit": per_sub}
+        params = {"q": query, "sort": "relevance", "t": "week", "restrict_sr": "true", "limit": per_sub}
         try:
             resp = httpx.get(url, params=params, headers=headers, timeout=10)
             resp.raise_for_status()
@@ -174,8 +209,8 @@ def print_aggregate(query: str, all_scores: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="FinBERT sentiment test")
-    parser.add_argument("--query", default="trump visit china",
-                        help="Market query to test (default: 'trump visit china')")
+    parser.add_argument("--query", default="trump AND impeach",
+                        help="Market query; use boolean AND for tight matching, e.g. 'trump AND impeach' (default: 'trump AND impeach')")
     parser.add_argument("--max", type=int, default=5,
                         help="Max articles per source (default: 5)")
     args = parser.parse_args()

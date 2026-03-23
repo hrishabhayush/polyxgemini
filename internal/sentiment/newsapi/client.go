@@ -39,17 +39,22 @@ func NewClient(cfg config.SentimentConfig) *Client {
 }
 
 // FetchHeadlines queries /v2/everything for the given keywords.
-// Returns at most maxResults articles sorted by publishedAt descending.
+// Returns at most maxResults articles ranked by relevance within the last 7 days.
+// Pass keywords using NewsAPI boolean syntax, e.g. `trump AND impeach` or
+// `"trump impeachment"` for exact-phrase matching.
 func (c *Client) FetchHeadlines(ctx context.Context, keywords string, maxResults int) ([]Article, error) {
 	if c.cfg.NewsAPIKey == "" {
 		return nil, ErrNoAPIKey
 	}
 
+	from := time.Now().UTC().AddDate(0, 0, -7).Format("2006-01-02")
+
 	params := url.Values{}
 	params.Set("q", keywords)
-	params.Set("sortBy", "publishedAt")
+	params.Set("sortBy", "relevance") // was publishedAt; recency-only sort returns off-topic recent articles
 	params.Set("language", "en")
 	params.Set("pageSize", strconv.Itoa(maxResults))
+	params.Set("from", from) // restrict to last 7 days to avoid stale noise
 
 	endpoint := c.cfg.NewsAPIBaseURL + "/everything?" + params.Encode()
 
