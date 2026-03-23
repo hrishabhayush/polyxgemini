@@ -57,9 +57,24 @@ type GeminiMarketEntry struct {
 	Ticker string `yaml:"ticker"`
 }
 
+// OutcomeMapping maps a Polymarket outcome to a Gemini contract label.
+type OutcomeMapping struct {
+	PolyOutcome string `yaml:"poly_outcome"` // "yes" or "no"
+	GeminiLabel string `yaml:"gemini_label"` // e.g. "UCLA", "UConn"
+}
+
+// PairEntry defines a matched market across both exchanges.
+type PairEntry struct {
+	Name           string           `yaml:"name"`
+	PolymarketSlug string           `yaml:"polymarket_slug"`
+	GeminiTicker   string           `yaml:"gemini_ticker"`
+	Mapping        []OutcomeMapping `yaml:"mapping"`
+}
+
 type Watchlist struct {
 	Markets       []MarketEntry       `yaml:"markets"`
 	GeminiMarkets []GeminiMarketEntry `yaml:"gemini_markets"`
+	Pairs         []PairEntry         `yaml:"pairs"`
 }
 
 func LoadWatchlist(path string) (*Watchlist, error) {

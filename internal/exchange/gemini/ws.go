@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
+	"github.com/hrishabhayush/polyxgemini/internal/arb"
 )
 
 const defaultWSURL = "wss://ws.gemini.com"
@@ -25,17 +26,31 @@ type BookTicker struct {
 
 // WSClient connects to Gemini WebSocket for prediction market data.
 type WSClient struct {
-	wsURL   string
-	conn    *websocket.Conn
-	markets []ResolvedEvent
-	// Maps instrumentSymbol -> human label
+	wsURL        string
+	conn         *websocket.Conn
+	markets      []ResolvedEvent
 	symbolLabels map[string]string
+	// Maps lowercase instrumentSymbol -> {pairID, outcome}
+	symbolToPair map[string]symbolPairInfo
+	updates      chan<- arb.PriceUpdate
 	mu           sync.Mutex
 	done         chan struct{}
 }
 
+type symbolPairInfo struct {
+	PairID  string
+	Outcome string // "yes" or "no"
+}
+
+// PairMapping tells the WS client which instrument symbols belong to which arb pair.
+type PairMapping struct {
+	PairID           string
+	InstrumentSymbol string // as returned by API (uppercase)
+	Outcome          string // "yes" or "no"
+}
+
 // NewWSClient creates a Gemini WS client for the given resolved events.
-func NewWSClient(wsURL string, markets []ResolvedEvent) *WSClient {
+func NewWSClient(wsURL string, markets []ResolvedEvent, updates chan<- arb.PriceUpdate, pairMappings []PairMapping) *WSClient {
 	if wsURL == "" {
 		wsURL = defaultWSURL
 	}
@@ -49,10 +64,21 @@ func NewWSClient(wsURL string, markets []ResolvedEvent) *WSClient {
 			labels[strings.ToLower(c.InstrumentSymbol)] = fmt.Sprintf("%s %s", short, c.Label)
 		}
 	}
+
+	symbolToPair := make(map[string]symbolPairInfo)
+	for _, pm := range pairMappings {
+		symbolToPair[strings.ToLower(pm.InstrumentSymbol)] = symbolPairInfo{
+			PairID:  pm.PairID,
+			Outcome: pm.Outcome,
+		}
+	}
+
 	return &WSClient{
 		wsURL:        wsURL,
 		markets:      markets,
 		symbolLabels: labels,
+		symbolToPair: symbolToPair,
+		updates:      updates,
 		done:         make(chan struct{}),
 	}
 }
@@ -77,12 +103,11 @@ func (w *WSClient) Connect() error {
 	var streams []string
 	for _, m := range w.markets {
 		for _, c := range m.Contracts {
-			// Gemini WS requires lowercase stream names
 			streams = append(streams, strings.ToLower(c.InstrumentSymbol)+"@bookTicker")
 		}
 	}
 
-	subMsg := map[string]interface{}{
+	subMsg := map[string]any{
 		"id":     "1",
 		"method": "subscribe",
 		"params": streams,
@@ -92,7 +117,6 @@ func (w *WSClient) Connect() error {
 	}
 	log.Printf("gemini ws: subscribed to %d streams", len(streams))
 
-	// Read loop
 	go w.readLoop()
 
 	return nil
@@ -117,13 +141,23 @@ func (w *WSClient) readLoop() {
 
 		log.Printf("[GEMI book]  %-40s | buy @ %s¢ | ask_qty: %s",
 			w.label(bt.Symbol), centsFromDecimal(bt.BestAsk), bt.AskQty)
+
+		// Push to arb detector if this symbol is in a pair
+		if info, ok := w.symbolToPair[bt.Symbol]; ok && w.updates != nil {
+			var askF float64
+			fmt.Sscanf(bt.BestAsk, "%f", &askF)
+			w.updates <- arb.PriceUpdate{
+				PairID:   info.PairID,
+				Exchange: "gemini",
+				Outcome:  info.Outcome,
+				AskPrice: askF,
+			}
+		}
 	}
 }
 
 // centsFromDecimal converts "0.87" -> "87.0"
 func centsFromDecimal(s string) string {
-	// Gemini prices are already 0-1 decimals
-	// Parse and multiply by 100 for cents display
 	var f float64
 	fmt.Sscanf(s, "%f", &f)
 	return fmt.Sprintf("%.1f", f*100)

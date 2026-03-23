@@ -5,21 +5,37 @@ import (
 	"log"
 	"time"
 
+	"github.com/hrishabhayush/polyxgemini/internal/arb"
 	polymarketrealtime "github.com/ivanzzeth/polymarket-go-real-time-data-client"
 	"github.com/shopspring/decimal"
 )
 
 // WSClient wraps the Polymarket real-time data client for CLOB market subscriptions.
 type WSClient struct {
-	client   *polymarketrealtime.Client
-	markets  []ResolvedMarket
-	tokenIDs []string
-	// Maps asset ID -> label like "BTC Up YES" / "BTC Up NO"
+	client      *polymarketrealtime.Client
+	markets     []ResolvedMarket
+	tokenIDs    []string
 	assetLabels map[string]string
+	// Maps token ID -> {pairID, outcome} for arb detection
+	tokenToPair map[string]tokenPairInfo
+	updates     chan<- arb.PriceUpdate
+}
+
+type tokenPairInfo struct {
+	PairID  string
+	Outcome string // "yes" or "no"
+}
+
+// PairMapping tells the WS client which token IDs belong to which arb pair.
+type PairMapping struct {
+	PairID      string
+	YesTokenID  string
+	NoTokenID   string
 }
 
 // NewWSClient creates a WebSocket client for the given resolved markets.
-func NewWSClient(markets []ResolvedMarket) *WSClient {
+// pairMappings is optional — if provided, price updates are sent to the arb detector.
+func NewWSClient(markets []ResolvedMarket, updates chan<- arb.PriceUpdate, pairMappings []PairMapping) *WSClient {
 	client := polymarketrealtime.New(
 		polymarketrealtime.WithAutoReconnect(true),
 		polymarketrealtime.WithPingInterval(10*time.Second),
@@ -43,7 +59,20 @@ func NewWSClient(markets []ResolvedMarket) *WSClient {
 		labels[m.ClobTokenIDs[1]] = fmt.Sprintf("%s NO", short)
 	}
 
-	return &WSClient{client: client, markets: markets, tokenIDs: tokenIDs, assetLabels: labels}
+	tokenToPair := make(map[string]tokenPairInfo)
+	for _, pm := range pairMappings {
+		tokenToPair[pm.YesTokenID] = tokenPairInfo{PairID: pm.PairID, Outcome: "yes"}
+		tokenToPair[pm.NoTokenID] = tokenPairInfo{PairID: pm.PairID, Outcome: "no"}
+	}
+
+	return &WSClient{
+		client:      client,
+		markets:     markets,
+		tokenIDs:    tokenIDs,
+		assetLabels: labels,
+		tokenToPair: tokenToPair,
+		updates:     updates,
+	}
 }
 
 func (w *WSClient) label(assetID string) string {
@@ -77,6 +106,17 @@ func (w *WSClient) Connect() error {
 			cents := bestAsk.Mul(decimal.NewFromInt(100))
 			log.Printf("[POLY book]  %-40s | buy @ %s¢ | asks: %d levels",
 				w.label(ob.AssetID), cents.StringFixed(1), len(ob.Asks))
+
+			// Push to arb detector if this token is in a pair
+			if info, ok := w.tokenToPair[ob.AssetID]; ok && w.updates != nil {
+				askF, _ := bestAsk.Float64()
+				w.updates <- arb.PriceUpdate{
+					PairID:   info.PairID,
+					Exchange: "poly",
+					Outcome:  info.Outcome,
+					AskPrice: askF,
+				}
+			}
 			return nil
 		},
 	)
@@ -95,6 +135,17 @@ func (w *WSClient) Connect() error {
 				askCents := c.BestAsk.Mul(decimal.NewFromInt(100))
 				log.Printf("[POLY price] %-40s | buy @ %s¢",
 					w.label(c.AssetID), askCents.StringFixed(1))
+
+				// Push to arb detector
+				if info, ok := w.tokenToPair[c.AssetID]; ok && w.updates != nil {
+					askF, _ := c.BestAsk.Float64()
+					w.updates <- arb.PriceUpdate{
+						PairID:   info.PairID,
+						Exchange: "poly",
+						Outcome:  info.Outcome,
+						AskPrice: askF,
+					}
+				}
 			}
 			return nil
 		},
