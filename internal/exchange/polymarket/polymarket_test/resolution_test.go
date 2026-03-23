@@ -181,8 +181,6 @@ func TestResolutionSourceFromMarket(t *testing.T) {
 	fmt.Printf("  RESOLUTION SOURCE FROM MARKET\n")
 	fmt.Printf("========================================================\n")
 	fmt.Printf("  Market:            %s\n", market.Question)
-	fmt.Printf("  Gamma ID:          %d\n", market.GammaID)
-	fmt.Printf("  Event ID:          %d\n", market.EventID)
 	fmt.Printf("  Resolution source: %q\n", market.ResolutionSource)
 	descPreview := market.Description
 	if len(descPreview) > 200 {

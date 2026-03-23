@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	defaultMarket      = "cs2-nem-k271-2026-03-23"
+	defaultMarket      = "nba-lal-det-2026-03-23"
 	defaultFinBERTURL  = "http://localhost:8765"
 	defaultNewsAPIBase = "https://newsapi.org/v2"
 	defaultGDELTBase   = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -232,44 +232,19 @@ func printReport(t *testing.T, rpt *report.MarketReport) {
 			rpt.WSTotalBidSize, rpt.WSTotalAskSize)
 	}
 
-	// Gamma comments
-	fmt.Printf("%s\n", thin)
-	fmt.Printf("  GAMMA COMMENTS\n")
-	fmt.Printf("%s\n", thin)
-	if rpt.GammaCommentCount == 0 {
-		fmt.Printf("  (no relevant comments found)\n")
-	} else if !rpt.NLPAvailable {
-		fmt.Printf("  %-24s %d (NLP unavailable — scores pending)\n",
-			"Relevant comments", rpt.GammaCommentCount)
-	} else {
-		fmt.Printf("  %-24s %d\n", "Relevant comments", rpt.GammaCommentCount)
-		fmt.Printf("  %-24s %.4f\n", "Bullish (weighted)", rpt.GammaCommentBullish)
-		fmt.Printf("  %-24s %.4f\n", "Bearish (weighted)", rpt.GammaCommentBearish)
-		gcNet := rpt.GammaCommentBullish - rpt.GammaCommentBearish
-		gcDir := "NEUTRAL"
-		if gcNet > 0.1 {
-			gcDir = "BULLISH"
-		} else if gcNet < -0.1 {
-			gcDir = "BEARISH"
-		}
-		fmt.Printf("  %-24s %-12s %s\n", "Net signal",
-			fmt.Sprintf("%+.4f", gcNet), gcDir)
-	}
-
 	// Sentiment
 	fmt.Printf("%s\n", thin)
 	newsapiN := rpt.SourceCounts["newsapi"]
 	gdeltN := rpt.SourceCounts["gdelt"]
 	redditN := rpt.SourceCounts["reddit"]
-	gammaCommN := rpt.SourceCounts["gamma_comments"]
 	fmt.Printf("  NEWS SENTIMENT  (%d articles, last 7d)\n", rpt.ArticleCount)
 	fmt.Printf("%s\n", thin)
 	if rpt.ArticleCount == 0 {
 		fmt.Printf("  (no articles found)\n")
 	} else if !rpt.NLPAvailable {
 		fmt.Printf("  NLP scoring unavailable — start FinBERT server for scores\n")
-		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)  Gamma(%-3d)\n",
-			"Sources", newsapiN, gdeltN, redditN, gammaCommN)
+		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)\n",
+			"Sources", newsapiN, gdeltN, redditN)
 	} else {
 		net := rpt.BullishScore - rpt.BearishScore
 		netDir := "NEUTRAL"
@@ -282,8 +257,8 @@ func printReport(t *testing.T, rpt *report.MarketReport) {
 		fmt.Printf("  %-24s %.4f\n", "Bearish", rpt.BearishScore)
 		fmt.Printf("  %-24s %-12s %s\n", "Net signal",
 			fmt.Sprintf("%+.4f", net), netDir)
-		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)  Gamma(%-3d)\n",
-			"Sources", newsapiN, gdeltN, redditN, gammaCommN)
+		fmt.Printf("  %-24s NewsAPI(%-3d)  GDELT(%-3d)  Reddit(%-3d)\n",
+			"Sources", newsapiN, gdeltN, redditN)
 	}
 
 	// Resolution source
