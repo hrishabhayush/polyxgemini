@@ -15,7 +15,6 @@ config/markets.yaml
 .vscode/
 *.swp
 
-#docs
-docs/
-
 .env
+
+docs/

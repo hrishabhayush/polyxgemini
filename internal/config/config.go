@@ -10,6 +10,7 @@ type Config struct {
 	Polymarket PolymarketConfig `yaml:"polymarket"`
 	Gemini     GeminiConfig     `yaml:"gemini"`
 	Engine     EngineConfig     `yaml:"engine"`
+	Sentiment  SentimentConfig  `yaml:"sentiment"`
 }
 
 type PolymarketConfig struct {
@@ -36,6 +37,19 @@ type EngineConfig struct {
 	MinSpreadBPS   int     `yaml:"min_spread_bps"`
 	MaxPositionUSD float64 `yaml:"max_position_usd"`
 	DryRun         bool    `yaml:"dry_run"`
+}
+
+type SentimentConfig struct {
+	NewsAPIKey          string   `yaml:"newsapi_key"`
+	NewsAPIBaseURL      string   `yaml:"newsapi_base_url"`
+	GDELTBaseURL        string   `yaml:"gdelt_base_url"`
+	RedditBaseURL       string   `yaml:"reddit_base_url"`
+	RedditUserAgent     string   `yaml:"reddit_user_agent"`
+	RedditClientID      string   `yaml:"reddit_client_id"`
+	RedditClientSecret  string   `yaml:"reddit_client_secret"`
+	RedditSubreddits    []string `yaml:"reddit_subreddits"`
+	FinBERTServerURL    string   `yaml:"finbert_server_url"`
+	PollIntervalSec     int      `yaml:"poll_interval_sec"`
 }
 
 func Load(path string) (*Config, error) {
