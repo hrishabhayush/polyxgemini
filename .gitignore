@@ -18,3 +18,10 @@ config/markets.yaml
 .env
 
 docs/
+
+# ML data & artifacts
+data/snapshots/*.jsonl
+data/*.parquet
+python/ml/artifacts/model.txt
+python/ml/artifacts/model_meta.json
+python/ml/artifacts/calibration.png

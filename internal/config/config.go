@@ -37,6 +37,8 @@ type EngineConfig struct {
 	MinSpreadBPS   int     `yaml:"min_spread_bps"`
 	MaxPositionUSD float64 `yaml:"max_position_usd"`
 	DryRun         bool    `yaml:"dry_run"`
+	MLServerURL    string  `yaml:"ml_server_url"`
+	MinEdge        float64 `yaml:"min_edge"`
 }
 
 type SentimentConfig struct {

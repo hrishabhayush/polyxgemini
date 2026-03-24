@@ -17,7 +17,7 @@ func TestFetchArticles_Integration(t *testing.T) {
 	}
 	client := gdelt.NewClient(cfg)
 
-	articles, err := client.FetchArticles(context.Background(), "trump visit china", 5)
+	articles, err := client.FetchArticles(context.Background(), "trump visit china", 5, "7d")
 	if err != nil {
 		t.Fatalf("FetchArticles error: %v", err)
 	}

@@ -68,18 +68,62 @@ func (c *Client) discoverWithLimit(ctx context.Context, active bool, minVolume f
 
 	markets := make([]ResolvedMarket, 0, len(raw))
 	for _, m := range raw {
-		var tokenIDs []string
-		if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) < 2 {
-			continue // skip markets with malformed token IDs
+		rm := toResolvedMarket(m)
+		if rm == nil {
+			continue
 		}
-		markets = append(markets, ResolvedMarket{
-			Slug:             m.Slug,
-			Question:         m.Question,
-			ConditionID:      m.ConditionID,
-			ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
-			ResolutionSource: m.ResolutionSource,
-			Description:      m.Description,
-		})
+		markets = append(markets, *rm)
+	}
+	return markets, nil
+}
+
+// DiscoverResolvedMarkets fetches closed markets with known outcomes from the Gamma API.
+// Useful for building ML training datasets from historical resolutions.
+// offset enables pagination; the Gamma API returns up to limit results per call.
+// closedAfter, if non-zero, filters to markets whose end date is after that time
+// (use this to restrict to recently-resolved markets where CLOB data still exists).
+func (c *Client) DiscoverResolvedMarkets(ctx context.Context, limit, offset int, closedAfter time.Time) ([]ResolvedMarket, error) {
+	params := url.Values{}
+	params.Set("closed", "true")
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("offset", strconv.Itoa(offset))
+	params.Set("order", "endDateIso")
+	params.Set("ascending", "false")
+	if !closedAfter.IsZero() {
+		params.Set("endDateMin", closedAfter.Format(time.RFC3339))
+	}
+
+	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gamma: unexpected status %d", resp.StatusCode)
+	}
+
+	var raw []gammaMarketResponse
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("gamma: decode: %w", err)
+	}
+
+	markets := make([]ResolvedMarket, 0, len(raw))
+	for _, m := range raw {
+		if resolveOutcomeFromGamma(m) == "" {
+			continue // skip markets without a resolved outcome
+		}
+		rm := toResolvedMarket(m)
+		if rm == nil {
+			continue
+		}
+		markets = append(markets, *rm)
 	}
 	return markets, nil
 }
@@ -134,18 +178,11 @@ func (c *Client) FindMarket(ctx context.Context, query string) (*ResolvedMarket,
 			(qNorm != "" && (strings.Contains(questionNorm, qNorm) ||
 				strings.Contains(qNorm, questionNorm) ||
 				strings.Contains(slugNorm, qNorm))) {
-			var tokenIDs []string
-			if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) < 2 {
+			rm := toResolvedMarket(m)
+			if rm == nil {
 				continue
 			}
-			return &ResolvedMarket{
-				Slug:             m.Slug,
-				Question:         m.Question,
-				ConditionID:      m.ConditionID,
-				ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
-				ResolutionSource: m.ResolutionSource,
-				Description:      m.Description,
-			}, nil
+			return rm, nil
 		}
 	}
 	return nil, fmt.Errorf("polymarket: no active market matching %q", query)
@@ -245,10 +282,14 @@ type ResolvedMarket struct {
 	ClobTokenIDs     [2]string // [YES, NO]
 	ResolutionSource string    // URL or text describing how the market resolves
 	Description      string    // full market description / rules
+	Outcome          string    // "Yes" / "No" / "" (populated for closed markets)
+	Closed           bool
+	EndDate          time.Time
+	CreatedAt        time.Time
 }
 
 // gammaMarketResponse is the raw Gamma API response for a single market.
-// Note: clobTokenIds comes back as a JSON-encoded string, not a native array.
+// Note: clobTokenIds, outcomes, and outcomePrices come back as JSON-encoded strings, not native arrays.
 type gammaMarketResponse struct {
 	Slug             string `json:"slug"`
 	Question         string `json:"question"`
@@ -256,6 +297,109 @@ type gammaMarketResponse struct {
 	ClobTokenIDs     string `json:"clobTokenIds"`
 	ResolutionSource string `json:"resolutionSource"`
 	Description      string `json:"description"`
+	Outcome          string `json:"outcome"` // set on some responses; often empty
+	Outcomes         string `json:"outcomes"`
+	OutcomePrices    string `json:"outcomePrices"`
+	Closed           bool   `json:"closed"`
+	EndDateISO       string `json:"endDateIso"`
+	EndDate          string `json:"endDate"` // alternate to endDateIso on some payloads
+	CreatedAt        string `json:"createdAt"`
+}
+
+// resolveOutcomeFromGamma returns the winning outcome label for a resolved market.
+// Gamma encodes outcomes and prices as JSON strings, e.g. outcomes="[\"Yes\",\"No\"]"
+// and outcomePrices="[\"1\",\"0\"]" for a YES resolution. If outcomePrices are all
+// zero or parsing fails, returns "".
+//
+// For non-closed markets we only return m.Outcome when the API sets it; we never
+// infer resolution from outcomePrices (those are live implied probabilities).
+func resolveOutcomeFromGamma(m gammaMarketResponse) string {
+	if s := strings.TrimSpace(m.Outcome); s != "" {
+		return s
+	}
+	if !m.Closed {
+		return ""
+	}
+	var prices []string
+	if err := json.Unmarshal([]byte(m.OutcomePrices), &prices); err != nil || len(prices) == 0 {
+		return ""
+	}
+	var labels []string
+	if err := json.Unmarshal([]byte(m.Outcomes), &labels); err != nil || len(labels) == 0 {
+		return ""
+	}
+	if len(prices) != len(labels) {
+		return ""
+	}
+	// 1) Settled binary / n-ary: exactly one price is 1 (or ~1)
+	for i, p := range prices {
+		p = strings.TrimSpace(p)
+		if p == "1" {
+			return labels[i]
+		}
+		if f, err := strconv.ParseFloat(p, 64); err == nil && f >= 0.999 {
+			return labels[i]
+		}
+	}
+	// 2) All zeros / empty → unknown resolution in API
+	allTiny := true
+	for _, p := range prices {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err == nil && f > 1e-6 {
+			allTiny = false
+			break
+		}
+	}
+	if allTiny {
+		return ""
+	}
+	// 3) Closed market with only implied probs: pick argmax (last known prices)
+	bestIdx := -1
+	bestVal := -1.0
+	for i, p := range prices {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			continue
+		}
+		if f > bestVal {
+			bestVal = f
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 || bestVal <= 0 {
+		return ""
+	}
+	return labels[bestIdx]
+}
+
+// toResolvedMarket converts a gammaMarketResponse to a ResolvedMarket.
+// Returns nil if the response has malformed token IDs.
+func toResolvedMarket(m gammaMarketResponse) *ResolvedMarket {
+	var tokenIDs []string
+	if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) < 2 {
+		return nil
+	}
+	rm := &ResolvedMarket{
+		Slug:             m.Slug,
+		Question:         m.Question,
+		ConditionID:      m.ConditionID,
+		ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
+		ResolutionSource: m.ResolutionSource,
+		Description:      m.Description,
+		Outcome:          resolveOutcomeFromGamma(m),
+		Closed:           m.Closed,
+	}
+	dateStr := m.EndDateISO
+	if dateStr == "" {
+		dateStr = m.EndDate
+	}
+	if t, err := time.Parse(time.RFC3339, dateStr); err == nil {
+		rm.EndDate = t
+	}
+	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+		rm.CreatedAt = t
+	}
+	return rm
 }
 
 // ResolveMarket looks up a market by slug via the Gamma API and returns its token IDs.
@@ -286,23 +430,9 @@ func (c *Client) ResolveMarket(ctx context.Context, slug string) (*ResolvedMarke
 		return nil, fmt.Errorf("no market found for slug: %s", slug)
 	}
 
-	m := markets[0]
-
-	// clobTokenIds is a JSON string like '["token1", "token2"]' — parse it
-	var tokenIDs []string
-	if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil {
-		return nil, fmt.Errorf("failed to parse clobTokenIds for %s: %w", slug, err)
+	rm := toResolvedMarket(markets[0])
+	if rm == nil {
+		return nil, fmt.Errorf("market %s has malformed token IDs", slug)
 	}
-	if len(tokenIDs) < 2 {
-		return nil, fmt.Errorf("market %s has fewer than 2 token IDs", slug)
-	}
-
-	return &ResolvedMarket{
-		Slug:             m.Slug,
-		Question:         m.Question,
-		ConditionID:      m.ConditionID,
-		ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
-		ResolutionSource: m.ResolutionSource,
-		Description:      m.Description,
-	}, nil
+	return rm, nil
 }

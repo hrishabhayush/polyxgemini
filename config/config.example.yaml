@@ -20,6 +20,8 @@ engine:
   min_spread_bps: 50
   max_position_usd: 1000.0
   dry_run: true
+  ml_server_url: "http://localhost:8766"
+  min_edge: 0.05
 
 sentiment:
   newsapi_key: "8a4028324fe348a6a6b337f09287562f"

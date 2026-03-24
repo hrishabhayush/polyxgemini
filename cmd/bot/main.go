@@ -9,8 +9,11 @@ import (
 	"syscall"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
+	"github.com/hrishabhayush/polyxgemini/internal/engine"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/gemini"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/polymarket"
+	"github.com/hrishabhayush/polyxgemini/internal/ml"
+	"github.com/hrishabhayush/polyxgemini/internal/report"
 )
 
 func main() {
@@ -87,11 +90,32 @@ func main() {
 		log.Fatal("no markets resolved on either exchange")
 	}
 
+	// --- ML Scanner (optional) ---
+	scanCtx, scanCancel := context.WithCancel(ctx)
+	defer scanCancel()
+
+	if cfg.Engine.MLServerURL != "" && len(polyResolved) > 0 {
+		mlClient := ml.NewClient(cfg.Engine.MLServerURL)
+		if err := mlClient.Ping(ctx); err != nil {
+			log.Printf("[ml] prediction server not available at %s: %v", cfg.Engine.MLServerURL, err)
+		} else {
+			reportGen := report.NewGenerator(cfg.Polymarket, cfg.Sentiment)
+			scanner := engine.NewMLScanner(reportGen, mlClient, polyClient, cfg.Engine)
+			go func() {
+				if err := scanner.Run(scanCtx, polyResolved); err != nil && scanCtx.Err() == nil {
+					log.Printf("[ml] scanner stopped: %v", err)
+				}
+			}()
+			log.Printf("[ml] scanner running for %d markets", len(polyResolved))
+		}
+	}
+
 	log.Println("listening for updates... (Ctrl+C to stop)")
 
 	// Wait for interrupt
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	scanCancel()
 	log.Println("shutting down...")
 }

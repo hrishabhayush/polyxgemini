@@ -186,7 +186,7 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 		return titles, len(articles)
 	})
 	go fetch("gdelt", func() ([]string, int) {
-		articles, err := g.gdelt.FetchArticles(ctx, broadQ, 20)
+		articles, err := g.gdelt.FetchArticles(ctx, broadQ, 20, "7d")
 		if err != nil {
 			return nil, 0
 		}
@@ -197,7 +197,7 @@ func (g *Generator) Generate(ctx context.Context, marketName string) (*MarketRep
 		return titles, len(articles)
 	})
 	go fetch("reddit", func() ([]string, int) {
-		posts, err := g.reddit.Search(ctx, broadQ, 15)
+		posts, err := g.reddit.Search(ctx, broadQ, 15, "week")
 		if err != nil {
 			return nil, 0
 		}

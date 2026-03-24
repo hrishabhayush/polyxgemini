@@ -53,12 +53,17 @@ type redditResponse struct {
 }
 
 // Search queries Reddit for posts matching keywords.
+// timePeriod controls the lookback: "hour", "day", "week", "month", "year", "all".
+// If empty, defaults to "week".
 // If RedditSubreddits is set, searches each subreddit individually and merges results.
 // Otherwise does a global search. Returns at most maxResults posts total.
-func (c *Client) Search(ctx context.Context, keywords string, maxResults int) ([]Post, error) {
+func (c *Client) Search(ctx context.Context, keywords string, maxResults int, timePeriod string) ([]Post, error) {
+	if timePeriod == "" {
+		timePeriod = "week"
+	}
 	subs := c.cfg.RedditSubreddits
 	if len(subs) == 0 {
-		return c.searchGlobal(ctx, keywords, maxResults)
+		return c.searchGlobal(ctx, keywords, maxResults, timePeriod)
 	}
 
 	// Per-subreddit search, distribute limit evenly
@@ -67,7 +72,7 @@ func (c *Client) Search(ctx context.Context, keywords string, maxResults int) ([
 	var all []Post
 
 	for _, sub := range subs {
-		posts, err := c.searchSubreddit(ctx, keywords, sub, perSub)
+		posts, err := c.searchSubreddit(ctx, keywords, sub, perSub, timePeriod)
 		if err != nil {
 			// Log and continue — one subreddit failing shouldn't abort all
 			continue
@@ -87,21 +92,21 @@ func (c *Client) Search(ctx context.Context, keywords string, maxResults int) ([
 	return all, nil
 }
 
-func (c *Client) searchGlobal(ctx context.Context, keywords string, limit int) ([]Post, error) {
-	endpoint := c.buildURL("/search.json", keywords, limit, false)
+func (c *Client) searchGlobal(ctx context.Context, keywords string, limit int, timePeriod string) ([]Post, error) {
+	endpoint := c.buildURL("/search.json", keywords, limit, false, timePeriod)
 	return c.fetch(ctx, endpoint)
 }
 
-func (c *Client) searchSubreddit(ctx context.Context, keywords, subreddit string, limit int) ([]Post, error) {
-	endpoint := c.buildURL("/r/"+subreddit+"/search.json", keywords, limit, true)
+func (c *Client) searchSubreddit(ctx context.Context, keywords, subreddit string, limit int, timePeriod string) ([]Post, error) {
+	endpoint := c.buildURL("/r/"+subreddit+"/search.json", keywords, limit, true, timePeriod)
 	return c.fetch(ctx, endpoint)
 }
 
-func (c *Client) buildURL(path, keywords string, limit int, restrictSR bool) string {
+func (c *Client) buildURL(path, keywords string, limit int, restrictSR bool, timePeriod string) string {
 	params := url.Values{}
 	params.Set("q", keywords)
 	params.Set("sort", "relevance") // was "new"; recency sort pushes off-topic recent posts
-	params.Set("t", "week")         // only posts from the last 7 days
+	params.Set("t", timePeriod)
 	params.Set("limit", strconv.Itoa(limit))
 	if restrictSR {
 		params.Set("restrict_sr", "true")
