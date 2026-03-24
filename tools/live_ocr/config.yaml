@@ -1,0 +1,38 @@
+capture:
+  ffmpeg_bin: ffmpeg
+  fps: 2
+  screen_index: '1'
+  pixel_format: bgr24
+  capture_rect:
+    x: 0
+    y: 0
+    width: 2000
+    height: 1500
+  resize_width: 720
+  window_title: ''
+ocr:
+  language: en
+  use_angle_cls: false
+  det_db_box_thresh: 0.4
+  det_db_thresh: 0.25
+  rec_score_thresh: 0.55
+roi:
+  bottom_fraction: 0.7
+  horizontal_margin_fraction: 0.08
+  locked_rect:
+    x: 34
+    y: 414
+    width: 620
+    height: 93
+  locked_rect_frame:
+    width: 720
+    height: 540
+postprocess:
+  min_confidence: 0.55
+  min_characters: 2
+  stable_hits_required: 2
+  duplicate_silence_seconds: 12.0
+output:
+  emit_stdout_json: true
+  save_srt: false
+  srt_path: data/snapshots/live_subtitles.srt

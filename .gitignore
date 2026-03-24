@@ -14,3 +14,7 @@ config/markets.yaml
 .idea/
 .vscode/
 *.swp
+
+.env
+.docs
+.venv-ocr/

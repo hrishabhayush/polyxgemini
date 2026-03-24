@@ -1,0 +1,7 @@
+numpy
+opencv-python
+pyyaml
+paddleocr>=2.7,<3.0
+# paddleocr/paddlex runtime may require langchain module paths.
+langchain<0.2
+
