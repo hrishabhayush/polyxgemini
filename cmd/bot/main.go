@@ -30,6 +30,19 @@ func main() {
 	}
 	log.Printf("config loaded from %s", *configPath)
 
+	// Validate API keys when running live
+	if !cfg.Engine.DryRun {
+		if cfg.Polymarket.APIKey == "" || cfg.Polymarket.APISecret == "" {
+			log.Fatal("polymarket api_key and api_secret are required when dry_run is false")
+		}
+		if cfg.Gemini.APIKey == "" || cfg.Gemini.APISecret == "" {
+			log.Fatal("gemini api_key and api_secret are required when dry_run is false")
+		}
+		log.Println("[MODE] LIVE — real orders will be placed")
+	} else {
+		log.Println("[MODE] DRY-RUN — no real orders will be placed")
+	}
+
 	wl, err := config.LoadWatchlist(cfg.Polymarket.WatchlistPath)
 	if err != nil {
 		log.Fatalf("failed to load watchlist: %v", err)
@@ -43,11 +56,11 @@ func main() {
 	polyClient := polymarket.NewClient(cfg.Polymarket)
 	geminiClient := gemini.NewClient(cfg.Gemini)
 
-	// Budget: $10 global spending cap (dry-run)
+	// Budget: $10 global spending cap
 	budgetTracker := budget.New(10.0, cancel)
 
 	// Arb detector
-	detector := arb.NewDetector(256, budgetTracker)
+	detector := arb.NewDetector(256, budgetTracker, cfg.Engine.DryRun, polyClient, geminiClient)
 	updates := detector.Updates()
 
 	// Collect all polymarket markets to subscribe to (standalone + pairs)
@@ -109,12 +122,16 @@ func main() {
 			Category:   pair.Category,
 		})
 
+		// Build MarketIDs for the arb detector
+		mids := &arb.MarketIDs{
+			PolyYesTokenID: polyM.ClobTokenIDs[0],
+			PolyNoTokenID:  polyM.ClobTokenIDs[1],
+		}
+
 		// Map gemini contracts to outcomes based on the mapping config
 		for _, om := range pair.Mapping {
 			for _, c := range geminiE.Contracts {
 				if strings.EqualFold(c.Label, om.GeminiLabel) {
-					// If poly "yes" maps to this gemini label, then this gemini contract = "yes"
-					// and the other gemini contract = "no"
 					outcome := om.PolyOutcome
 					geminiPairMappings = append(geminiPairMappings, gemini.PairMapping{
 						PairID:           pair.Name,
@@ -122,6 +139,11 @@ func main() {
 						Outcome:          outcome,
 						Category:         pair.Category,
 					})
+					if outcome == "yes" {
+						mids.GeminiYesSymbol = c.InstrumentSymbol
+					} else {
+						mids.GeminiNoSymbol = c.InstrumentSymbol
+					}
 				}
 			}
 		}
@@ -148,8 +170,16 @@ func main() {
 					Outcome:          opposite,
 					Category:         pair.Category,
 				})
+				if opposite == "yes" && mids.GeminiYesSymbol == "" {
+					mids.GeminiYesSymbol = c.InstrumentSymbol
+				} else if opposite == "no" && mids.GeminiNoSymbol == "" {
+					mids.GeminiNoSymbol = c.InstrumentSymbol
+				}
 			}
 		}
+
+		// Register market IDs with the arb detector
+		detector.RegisterPair(pair.Name, mids)
 
 		log.Printf("[pair] %q: poly=%s, gemini=%s (%d contracts)",
 			pair.Name, polyM.Slug, geminiE.Ticker, len(geminiE.Contracts))

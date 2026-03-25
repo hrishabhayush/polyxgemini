@@ -1,10 +1,18 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange"
@@ -30,8 +38,81 @@ func (c *Client) FetchOrderBook(ctx context.Context, symbol string) (*exchange.O
 }
 
 func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (*exchange.Order, error) {
-	// TODO: POST base_url/order (authenticated, HMAC-SHA384)
-	return nil, nil
+	nonce := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	endpoint := "/v1/order/new"
+
+	payload := map[string]any{
+		"request":       endpoint,
+		"nonce":         nonce,
+		"symbol":        order.MarketID,
+		"amount":        strconv.FormatFloat(order.Quantity, 'f', 0, 64),
+		"price":         strconv.FormatFloat(order.Price, 'f', 4, 64),
+		"side":          "buy",
+		"type":          "exchange limit",
+		"options":       []string{"fill-or-kill"},
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("gemini: marshal order: %w", err)
+	}
+
+	b64Payload := base64.StdEncoding.EncodeToString(payloadJSON)
+	sig := c.sign(b64Payload)
+
+	url := fmt.Sprintf("%s%s", c.baseURL(), endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte{}))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Content-Length", "0")
+	req.Header.Set("X-GEMINI-APIKEY", c.cfg.APIKey)
+	req.Header.Set("X-GEMINI-PAYLOAD", b64Payload)
+	req.Header.Set("X-GEMINI-SIGNATURE", sig)
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gemini: order request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gemini: order returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		OrderID       string `json:"order_id"`
+		ExecutedAmt   string `json:"executed_amount"`
+		IsLive        bool   `json:"is_live"`
+		IsCancelled   bool   `json:"is_cancelled"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("gemini: decode order response: %w", err)
+	}
+
+	var filledQty float64
+	fmt.Sscanf(result.ExecutedAmt, "%f", &filledQty)
+
+	status := "filled"
+	if result.IsCancelled {
+		status = "cancelled"
+	} else if filledQty == 0 {
+		status = "unfilled"
+	}
+
+	return &exchange.Order{
+		ID:        result.OrderID,
+		Status:    status,
+		FilledQty: filledQty,
+	}, nil
+}
+
+func (c *Client) sign(b64Payload string) string {
+	mac := hmac.New(sha512.New384, []byte(c.cfg.APISecret))
+	mac.Write([]byte(b64Payload))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (c *Client) CancelOrder(ctx context.Context, orderID string) error {

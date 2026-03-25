@@ -1,10 +1,17 @@
 package polymarket
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange"
@@ -30,8 +37,68 @@ func (c *Client) FetchOrderBook(ctx context.Context, tokenID string) (*exchange.
 }
 
 func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (*exchange.Order, error) {
-	// TODO: POST clob_base_url/order (authenticated)
-	return nil, nil
+	body := map[string]any{
+		"tokenID":   order.MarketID,
+		"price":     strconv.FormatFloat(order.Price, 'f', 4, 64),
+		"size":      strconv.FormatFloat(order.Quantity, 'f', 0, 64),
+		"side":      "BUY",
+		"type":      "FOK",
+		"feeRateBps": "0",
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: marshal order: %w", err)
+	}
+
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := c.sign(timestamp, string(payload))
+
+	url := fmt.Sprintf("%s/order", c.cfg.CLOBBaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("POLY-ADDRESS", c.cfg.APIKey)
+	req.Header.Set("POLY-SIGNATURE", sig)
+	req.Header.Set("POLY-TIMESTAMP", timestamp)
+	req.Header.Set("POLY-NONCE", timestamp)
+	if c.cfg.Passphrase != "" {
+		req.Header.Set("POLY-PASSPHRASE", c.cfg.Passphrase)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: order request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("polymarket: order returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		OrderID   string  `json:"orderID"`
+		Status    string  `json:"status"`
+		FilledQty float64 `json:"filledSize"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("polymarket: decode order response: %w", err)
+	}
+
+	return &exchange.Order{
+		ID:        result.OrderID,
+		Status:    result.Status,
+		FilledQty: result.FilledQty,
+	}, nil
+}
+
+func (c *Client) sign(timestamp, payload string) string {
+	message := timestamp + payload
+	mac := hmac.New(sha256.New, []byte(c.cfg.APISecret))
+	mac.Write([]byte(message))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (c *Client) CancelOrder(ctx context.Context, orderID string) error {

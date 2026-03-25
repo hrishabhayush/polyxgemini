@@ -1,11 +1,14 @@
 package arb
 
 import (
+	"context"
 	"log"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/hrishabhayush/polyxgemini/internal/budget"
+	"github.com/hrishabhayush/polyxgemini/internal/exchange"
 	"github.com/hrishabhayush/polyxgemini/internal/fees"
 	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
@@ -33,20 +36,52 @@ type pairState struct {
 	GeminiNoAskQty  float64
 }
 
-// Detector listens for price updates and checks for arb opportunities.
-type Detector struct {
-	updates chan PriceUpdate
-	state   map[string]*pairState // keyed by PairID
-	mu      sync.Mutex
-	budget  *budget.Budget
+// MarketIDs maps a pair to its exchange-specific identifiers.
+type MarketIDs struct {
+	PolyYesTokenID  string
+	PolyNoTokenID   string
+	GeminiYesSymbol string
+	GeminiNoSymbol  string
 }
 
-func NewDetector(bufSize int, b *budget.Budget) *Detector {
+// Detector listens for price updates and checks for arb opportunities.
+type Detector struct {
+	updates      chan PriceUpdate
+	state        map[string]*pairState // keyed by PairID
+	mu           sync.Mutex
+	budget       *budget.Budget
+	dryRun       bool
+	polyClient   exchange.Exchange
+	geminiClient exchange.Exchange
+	marketIDs    map[string]*MarketIDs // keyed by PairID
+}
+
+func NewDetector(bufSize int, b *budget.Budget, dryRun bool, polyClient exchange.Exchange, geminiClient exchange.Exchange) *Detector {
 	return &Detector{
-		updates: make(chan PriceUpdate, bufSize),
-		state:   make(map[string]*pairState),
-		budget:  b,
+		updates:      make(chan PriceUpdate, bufSize),
+		state:        make(map[string]*pairState),
+		budget:       b,
+		dryRun:       dryRun,
+		polyClient:   polyClient,
+		geminiClient: geminiClient,
+		marketIDs:    make(map[string]*MarketIDs),
 	}
+}
+
+// RegisterPair registers exchange-specific market IDs for a pair.
+func (d *Detector) RegisterPair(pairID string, ids *MarketIDs) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.marketIDs[pairID] = ids
+	log.Printf("[ARB] registered market IDs for %s: poly_yes=%s poly_no=%s gemini_yes=%s gemini_no=%s",
+		pairID, ids.PolyYesTokenID, ids.PolyNoTokenID, ids.GeminiYesSymbol, ids.GeminiNoSymbol)
+}
+
+// MarketIDsFor returns the market IDs for a pair, or nil if not registered.
+func (d *Detector) MarketIDsFor(pairID string) *MarketIDs {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.marketIDs[pairID]
 }
 
 // Updates returns the channel to send price updates to.
@@ -135,8 +170,9 @@ func (d *Detector) checkArb(pairID string, ps *pairState) {
 	}
 }
 
-// executeFAK simulates a Fill-and-Kill order: buy as many contracts as available
-// at the best ask on both sides, limited by the remaining budget.
+// executeFAK executes a Fill-and-Kill arb trade on both legs.
+// In dry-run mode, it logs the trade without placing real orders.
+// In live mode, it places FOK orders sequentially: Poly leg 1, then Gemini leg 2.
 func (d *Detector) executeFAK(pairID, polySide, geminiSide string, polyAsk, polyFee, polyQty, geminiAsk, geminiFee, geminiQty, costPerPair float64) {
 	if d.budget == nil || d.budget.Exhausted() {
 		return
@@ -161,28 +197,119 @@ func (d *Detector) executeFAK(pairID, polySide, geminiSide string, polyAsk, poly
 	}
 
 	totalCost := qty * costPerPair
-	totalProfit := qty * profitPerPair
 
 	spent, ok := d.budget.TrySpend(totalCost)
 	if !ok {
 		return
 	}
 
-	// Emit execution metrics
+	if d.dryRun {
+		d.emitMetrics(pairID, polySide, geminiSide, qty, polyAsk, polyFee, geminiAsk, geminiFee, spent, profitPerPair)
+		log.Printf("[TRADE-DRY] %s | BUY %.0f %s on Poly @ %.3f (fee %.4f) + BUY %.0f %s on Gemini @ %.3f (fee %.4f) | cost: $%.4f | profit: $%.4f (%.2f%%) | spent: $%.4f | remaining: $%.2f",
+			pairID,
+			qty, polySide, polyAsk, polyFee,
+			qty, geminiSide, geminiAsk, geminiFee,
+			spent, qty*profitPerPair, profitPerPair*100,
+			d.budget.Spent(), d.budget.Remaining())
+		return
+	}
+
+	// === LIVE EXECUTION ===
+	ids := d.marketIDs[pairID]
+	if ids == nil {
+		log.Printf("[TRADE-ERR] %s | no market IDs registered, refunding $%.4f", pairID, spent)
+		d.budget.Refund(spent)
+		return
+	}
+
+	// Determine which token/symbol to use based on side
+	polyTokenID := ids.PolyYesTokenID
+	if polySide == "NO" {
+		polyTokenID = ids.PolyNoTokenID
+	}
+	geminiSymbol := ids.GeminiYesSymbol
+	if geminiSide == "NO" {
+		geminiSymbol = ids.GeminiNoSymbol
+	}
+
+	// Leg 1: Polymarket FOK
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	polyOrder, err := d.polyClient.PlaceOrder(ctx, &exchange.OrderRequest{
+		MarketID: polyTokenID,
+		Side:     "buy",
+		Outcome:  polySide,
+		Price:    polyAsk,
+		Quantity: qty,
+	})
+	if err != nil || polyOrder == nil || polyOrder.FilledQty <= 0 {
+		errMsg := "nil response"
+		if err != nil {
+			errMsg = err.Error()
+		} else if polyOrder != nil {
+			errMsg = "0 fill"
+		}
+		log.Printf("[TRADE-ERR] %s | Poly leg failed (%s), refunding $%.4f", pairID, errMsg, spent)
+		d.budget.Refund(spent)
+		return
+	}
+
+	filledQty := polyOrder.FilledQty
+	log.Printf("[TRADE-LIVE] %s | Poly leg filled: %.0f %s @ %.3f (order: %s)", pairID, filledQty, polySide, polyAsk, polyOrder.ID)
+
+	// Leg 2: Gemini FOK using actual fill qty from leg 1
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	geminiOrder, err := d.geminiClient.PlaceOrder(ctx2, &exchange.OrderRequest{
+		MarketID: geminiSymbol,
+		Side:     "buy",
+		Outcome:  geminiSide,
+		Price:    geminiAsk,
+		Quantity: filledQty,
+	})
+	if err != nil || geminiOrder == nil || geminiOrder.FilledQty <= 0 {
+		errMsg := "nil response"
+		if err != nil {
+			errMsg = err.Error()
+		} else if geminiOrder != nil {
+			errMsg = "0 fill"
+		}
+		// ONE-LEGGED POSITION: Poly filled but Gemini failed. Do NOT refund.
+		log.Printf("[TRADE-WARN] %s | ONE-LEGGED POSITION: Poly filled %.0f %s but Gemini leg failed (%s). Manual intervention may be needed.",
+			pairID, filledQty, polySide, errMsg)
+		metrics.ArbOpportunitiesExecuted.WithLabelValues(pairID).Inc()
+		return
+	}
+
+	// Both legs filled
+	actualQty := math.Min(filledQty, geminiOrder.FilledQty)
+	actualSpent := actualQty * costPerPair
+	actualProfit := actualQty * profitPerPair
+
+	// Refund any overspend if actual fill < planned
+	if actualSpent < spent {
+		d.budget.Refund(spent - actualSpent)
+	}
+
+	d.emitMetrics(pairID, polySide, geminiSide, actualQty, polyAsk, polyFee, geminiAsk, geminiFee, actualSpent, profitPerPair)
+	log.Printf("[TRADE-LIVE] %s | BUY %.0f %s on Poly @ %.3f (order: %s) + BUY %.0f %s on Gemini @ %.3f (order: %s) | cost: $%.4f | profit: $%.4f (%.2f%%) | spent: $%.4f | remaining: $%.2f",
+		pairID,
+		filledQty, polySide, polyAsk, polyOrder.ID,
+		geminiOrder.FilledQty, geminiSide, geminiAsk, geminiOrder.ID,
+		actualSpent, actualProfit, profitPerPair*100,
+		d.budget.Spent(), d.budget.Remaining())
+}
+
+func (d *Detector) emitMetrics(pairID, polySide, geminiSide string, qty, polyAsk, polyFee, geminiAsk, geminiFee, spent, profitPerPair float64) {
 	metrics.ArbOpportunitiesExecuted.WithLabelValues(pairID).Inc()
 	metrics.CapitalDeployedUSD.WithLabelValues("polymarket").Add(qty * (polyAsk + polyFee))
 	metrics.CapitalDeployedUSD.WithLabelValues("gemini").Add(qty * (geminiAsk + geminiFee))
 	metrics.CapitalTotalUSD.Add(spent)
 	metrics.FeesTotalUSD.WithLabelValues("polymarket").Add(qty * polyFee)
 	metrics.FeesTotalUSD.WithLabelValues("gemini").Add(qty * geminiFee)
-	metrics.PnLRealizedUSD.WithLabelValues(pairID).Add(totalProfit)
+	metrics.PnLRealizedUSD.WithLabelValues(pairID).Add(qty * profitPerPair)
 	metrics.ActivePositions.WithLabelValues("polymarket", pairID, polySide).Add(qty)
 	metrics.ActivePositions.WithLabelValues("gemini", pairID, geminiSide).Add(qty)
-
-	log.Printf("[TRADE-DRY] %s | BUY %.0f %s on Poly @ %.3f (fee %.4f) + BUY %.0f %s on Gemini @ %.3f (fee %.4f) | cost: $%.4f | profit: $%.4f (%.2f%%) | spent: $%.4f | remaining: $%.2f",
-		pairID,
-		qty, polySide, polyAsk, polyFee,
-		qty, geminiSide, geminiAsk, geminiFee,
-		spent, totalProfit, profitPerPair*100,
-		d.budget.Spent(), d.budget.Remaining())
 }

@@ -49,6 +49,17 @@ func (b *Budget) TrySpend(amount float64) (float64, bool) {
 	return actual, true
 }
 
+// Refund returns budget when an order fails after TrySpend.
+func (b *Budget) Refund(amount float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.spent -= amount
+	if b.spent < 0 {
+		b.spent = 0
+	}
+	log.Printf("[BUDGET] refunded $%.4f (spent: $%.4f, remaining: $%.4f)", amount, b.spent, b.limit-b.spent)
+}
+
 // Remaining returns how much budget is left.
 func (b *Budget) Remaining() float64 {
 	b.mu.Lock()

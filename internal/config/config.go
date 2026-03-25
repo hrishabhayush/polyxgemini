@@ -19,6 +19,7 @@ type PolymarketConfig struct {
 	WatchlistPath string `yaml:"watchlist_path"`
 	APIKey        string `yaml:"api_key"`
 	APISecret     string `yaml:"api_secret"`
+	Passphrase    string `yaml:"passphrase"`
 }
 
 type GeminiConfig struct {
