@@ -7,6 +7,7 @@ import (
 
 	"github.com/hrishabhayush/polyxgemini/internal/budget"
 	"github.com/hrishabhayush/polyxgemini/internal/fees"
+	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
 
 // PriceUpdate is sent by WS clients when a new ask price is observed.
@@ -104,7 +105,10 @@ func (d *Detector) checkArb(pairID string, ps *pairState) {
 		polyCost := fees.EffectiveBuyCost(ps.PolyYesAsk, polyFee)
 		geminiCost := fees.EffectiveBuyCost(ps.GeminiNoAsk, geminiFee)
 		costPerPair := polyCost + geminiCost
+		spreadBPS := (1.0 - costPerPair) * 10000
+		metrics.ArbSpreadBPS.WithLabelValues(pairID, "poly_yes_gemini_no").Set(spreadBPS)
 		if costPerPair < 1.0 {
+			metrics.ArbOpportunitiesDetected.WithLabelValues(pairID).Inc()
 			d.executeFAK(pairID, "YES", "NO", ps.PolyYesAsk, polyFee, ps.PolyYesAskQty, ps.GeminiNoAsk, geminiFee, ps.GeminiNoAskQty, costPerPair)
 		} else {
 			log.Printf("[SCAN] %s | Poly YES %.3f + Gemini NO %.3f = %.4f (no arb)",
@@ -119,7 +123,10 @@ func (d *Detector) checkArb(pairID string, ps *pairState) {
 		polyCost := fees.EffectiveBuyCost(ps.PolyNoAsk, polyFee)
 		geminiCost := fees.EffectiveBuyCost(ps.GeminiYesAsk, geminiFee)
 		costPerPair := polyCost + geminiCost
+		spreadBPS := (1.0 - costPerPair) * 10000
+		metrics.ArbSpreadBPS.WithLabelValues(pairID, "poly_no_gemini_yes").Set(spreadBPS)
 		if costPerPair < 1.0 {
+			metrics.ArbOpportunitiesDetected.WithLabelValues(pairID).Inc()
 			d.executeFAK(pairID, "NO", "YES", ps.PolyNoAsk, polyFee, ps.PolyNoAskQty, ps.GeminiYesAsk, geminiFee, ps.GeminiYesAskQty, costPerPair)
 		} else {
 			log.Printf("[SCAN] %s | Poly NO %.3f + Gemini YES %.3f = %.4f (no arb)",
@@ -160,6 +167,17 @@ func (d *Detector) executeFAK(pairID, polySide, geminiSide string, polyAsk, poly
 	if !ok {
 		return
 	}
+
+	// Emit execution metrics
+	metrics.ArbOpportunitiesExecuted.WithLabelValues(pairID).Inc()
+	metrics.CapitalDeployedUSD.WithLabelValues("polymarket").Add(qty * (polyAsk + polyFee))
+	metrics.CapitalDeployedUSD.WithLabelValues("gemini").Add(qty * (geminiAsk + geminiFee))
+	metrics.CapitalTotalUSD.Add(spent)
+	metrics.FeesTotalUSD.WithLabelValues("polymarket").Add(qty * polyFee)
+	metrics.FeesTotalUSD.WithLabelValues("gemini").Add(qty * geminiFee)
+	metrics.PnLRealizedUSD.WithLabelValues(pairID).Add(totalProfit)
+	metrics.ActivePositions.WithLabelValues("polymarket", pairID, polySide).Add(qty)
+	metrics.ActivePositions.WithLabelValues("gemini", pairID, geminiSide).Add(qty)
 
 	log.Printf("[TRADE-DRY] %s | BUY %.0f %s on Poly @ %.3f (fee %.4f) + BUY %.0f %s on Gemini @ %.3f (fee %.4f) | cost: $%.4f | profit: $%.4f (%.2f%%) | spent: $%.4f | remaining: $%.2f",
 		pairID,

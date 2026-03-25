@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/hrishabhayush/polyxgemini/internal/arb"
+	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 	polymarketrealtime "github.com/ivanzzeth/polymarket-go-real-time-data-client"
 	"github.com/shopspring/decimal"
 )
@@ -43,9 +44,12 @@ func NewWSClient(markets []ResolvedMarket, updates chan<- arb.PriceUpdate, pairM
 		polymarketrealtime.WithPingInterval(10*time.Second),
 		polymarketrealtime.WithOnConnect(func() {
 			log.Println("polymarket ws: connected")
+			metrics.WSConnected.WithLabelValues("polymarket").Set(1)
 		}),
 		polymarketrealtime.WithOnDisconnect(func(err error) {
 			log.Printf("polymarket ws: disconnected: %v", err)
+			metrics.WSConnected.WithLabelValues("polymarket").Set(0)
+			metrics.WSDisconnectsTotal.WithLabelValues("polymarket").Inc()
 		}),
 	)
 
@@ -99,7 +103,11 @@ func (w *WSClient) Connect() error {
 	err := w.client.SubscribeToCLOBMarketAggOrderbook(
 		filter,
 		func(ob polymarketrealtime.AggOrderbook) error {
+			metrics.WSMessagesTotal.WithLabelValues("polymarket", "orderbook").Inc()
+			metrics.WSLastMessageTimestamp.WithLabelValues("polymarket").Set(float64(time.Now().Unix()))
+
 			bestAsk := decimal.NewFromInt(999)
+			bestBid := decimal.Zero
 			var bestAskSize decimal.Decimal
 			for _, a := range ob.Asks {
 				if a.Price.LessThan(bestAsk) {
@@ -107,14 +115,28 @@ func (w *WSClient) Connect() error {
 					bestAskSize = a.Size
 				}
 			}
+			for _, b := range ob.Bids {
+				if b.Price.GreaterThan(bestBid) {
+					bestBid = b.Price
+				}
+			}
+
+			label := w.label(ob.AssetID)
 			cents := bestAsk.Mul(decimal.NewFromInt(100))
 			log.Printf("[POLY book]  %-40s | buy @ %s¢ | qty: %s | asks: %d levels",
-				w.label(ob.AssetID), cents.StringFixed(1), bestAskSize.StringFixed(0), len(ob.Asks))
+				label, cents.StringFixed(1), bestAskSize.StringFixed(0), len(ob.Asks))
+
+			// Emit book metrics
+			askF, _ := bestAsk.Float64()
+			bidF, _ := bestBid.Float64()
+			qtyF, _ := bestAskSize.Float64()
+			metrics.BookBestAsk.WithLabelValues("polymarket", ob.AssetID).Set(askF * 100)
+			metrics.BookBestBid.WithLabelValues("polymarket", ob.AssetID).Set(bidF * 100)
+			metrics.BookDepthLevels.WithLabelValues("polymarket", ob.AssetID, "ask").Set(float64(len(ob.Asks)))
+			metrics.BookDepthLevels.WithLabelValues("polymarket", ob.AssetID, "bid").Set(float64(len(ob.Bids)))
 
 			// Push to arb detector if this token is in a pair
 			if info, ok := w.tokenToPair[ob.AssetID]; ok && w.updates != nil {
-				askF, _ := bestAsk.Float64()
-				qtyF, _ := bestAskSize.Float64()
 				w.updates <- arb.PriceUpdate{
 					PairID:   info.PairID,
 					Exchange: "poly",
@@ -138,14 +160,19 @@ func (w *WSClient) Connect() error {
 			if pc.Market == "" || len(pc.PriceChange) == 0 {
 				return nil
 			}
+			metrics.WSMessagesTotal.WithLabelValues("polymarket", "priceChange").Inc()
+			metrics.WSLastMessageTimestamp.WithLabelValues("polymarket").Set(float64(time.Now().Unix()))
+
 			for _, c := range pc.PriceChange {
 				askCents := c.BestAsk.Mul(decimal.NewFromInt(100))
 				log.Printf("[POLY price] %-40s | buy @ %s¢",
 					w.label(c.AssetID), askCents.StringFixed(1))
 
+				askF, _ := c.BestAsk.Float64()
+				metrics.BookBestAsk.WithLabelValues("polymarket", c.AssetID).Set(askF * 100)
+
 				// Push to arb detector
 				if info, ok := w.tokenToPair[c.AssetID]; ok && w.updates != nil {
-					askF, _ := c.BestAsk.Float64()
 					w.updates <- arb.PriceUpdate{
 						PairID:   info.PairID,
 						Exchange: "poly",

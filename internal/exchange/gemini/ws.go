@@ -6,9 +6,11 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/hrishabhayush/polyxgemini/internal/arb"
+	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
 
 const defaultWSURL = "wss://ws.gemini.com"
@@ -101,6 +103,7 @@ func (w *WSClient) Connect() error {
 	}
 	w.conn = conn
 	log.Println("gemini ws: connected")
+	metrics.WSConnected.WithLabelValues("gemini").Set(1)
 
 	// Subscribe to bookTicker for each contract
 	var streams []string
@@ -127,12 +130,19 @@ func (w *WSClient) Connect() error {
 
 func (w *WSClient) readLoop() {
 	defer close(w.done)
+	defer func() {
+		metrics.WSConnected.WithLabelValues("gemini").Set(0)
+		metrics.WSDisconnectsTotal.WithLabelValues("gemini").Inc()
+	}()
 	for {
 		_, msg, err := w.conn.ReadMessage()
 		if err != nil {
 			log.Printf("gemini ws: read error: %v", err)
 			return
 		}
+
+		metrics.WSMessagesTotal.WithLabelValues("gemini", "bookTicker").Inc()
+		metrics.WSLastMessageTimestamp.WithLabelValues("gemini").Set(float64(time.Now().Unix()))
 
 		var bt BookTicker
 		if err := json.Unmarshal(msg, &bt); err != nil {
@@ -142,14 +152,20 @@ func (w *WSClient) readLoop() {
 			continue
 		}
 
+		label := w.label(bt.Symbol)
 		log.Printf("[GEMI book]  %-40s | buy @ %s¢ | ask_qty: %s",
-			w.label(bt.Symbol), centsFromDecimal(bt.BestAsk), bt.AskQty)
+			label, centsFromDecimal(bt.BestAsk), bt.AskQty)
+
+		// Emit book metrics
+		var askF, bidF, qtyF float64
+		fmt.Sscanf(bt.BestAsk, "%f", &askF)
+		fmt.Sscanf(bt.BestBid, "%f", &bidF)
+		fmt.Sscanf(bt.AskQty, "%f", &qtyF)
+		metrics.BookBestAsk.WithLabelValues("gemini", bt.Symbol).Set(askF * 100)
+		metrics.BookBestBid.WithLabelValues("gemini", bt.Symbol).Set(bidF * 100)
 
 		// Push to arb detector if this symbol is in a pair
 		if info, ok := w.symbolToPair[bt.Symbol]; ok && w.updates != nil {
-			var askF, qtyF float64
-			fmt.Sscanf(bt.BestAsk, "%f", &askF)
-			fmt.Sscanf(bt.AskQty, "%f", &qtyF)
 			w.updates <- arb.PriceUpdate{
 				PairID:   info.PairID,
 				Exchange: "gemini",
