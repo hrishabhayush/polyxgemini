@@ -38,8 +38,9 @@ type WSClient struct {
 }
 
 type symbolPairInfo struct {
-	PairID  string
-	Outcome string // "yes" or "no"
+	PairID   string
+	Outcome  string // "yes" or "no"
+	Category string // "sports" or "crypto"
 }
 
 // PairMapping tells the WS client which instrument symbols belong to which arb pair.
@@ -47,6 +48,7 @@ type PairMapping struct {
 	PairID           string
 	InstrumentSymbol string // as returned by API (uppercase)
 	Outcome          string // "yes" or "no"
+	Category         string // "sports" (default) or "crypto"
 }
 
 // NewWSClient creates a Gemini WS client for the given resolved events.
@@ -68,8 +70,9 @@ func NewWSClient(wsURL string, markets []ResolvedEvent, updates chan<- arb.Price
 	symbolToPair := make(map[string]symbolPairInfo)
 	for _, pm := range pairMappings {
 		symbolToPair[strings.ToLower(pm.InstrumentSymbol)] = symbolPairInfo{
-			PairID:  pm.PairID,
-			Outcome: pm.Outcome,
+			PairID:   pm.PairID,
+			Outcome:  pm.Outcome,
+			Category: pm.Category,
 		}
 	}
 
@@ -144,13 +147,16 @@ func (w *WSClient) readLoop() {
 
 		// Push to arb detector if this symbol is in a pair
 		if info, ok := w.symbolToPair[bt.Symbol]; ok && w.updates != nil {
-			var askF float64
+			var askF, qtyF float64
 			fmt.Sscanf(bt.BestAsk, "%f", &askF)
+			fmt.Sscanf(bt.AskQty, "%f", &qtyF)
 			w.updates <- arb.PriceUpdate{
 				PairID:   info.PairID,
 				Exchange: "gemini",
 				Outcome:  info.Outcome,
 				AskPrice: askF,
+				AskQty:   qtyF,
+				Category: info.Category,
 			}
 		}
 	}

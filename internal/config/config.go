@@ -50,11 +50,13 @@ func Load(path string) (*Config, error) {
 }
 
 type MarketEntry struct {
-	Slug string `yaml:"slug"`
+	Slug     string `yaml:"slug"`
+	Category string `yaml:"category"`
 }
 
 type GeminiMarketEntry struct {
-	Ticker string `yaml:"ticker"`
+	Ticker   string `yaml:"ticker"`
+	Category string `yaml:"category"`
 }
 
 // OutcomeMapping maps a Polymarket outcome to a Gemini contract label.
@@ -66,6 +68,7 @@ type OutcomeMapping struct {
 // PairEntry defines a matched market across both exchanges.
 type PairEntry struct {
 	Name           string           `yaml:"name"`
+	Category       string           `yaml:"category"` // "sports" (default) or "crypto"
 	PolymarketSlug string           `yaml:"polymarket_slug"`
 	GeminiTicker   string           `yaml:"gemini_ticker"`
 	Mapping        []OutcomeMapping `yaml:"mapping"`

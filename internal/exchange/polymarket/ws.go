@@ -22,15 +22,17 @@ type WSClient struct {
 }
 
 type tokenPairInfo struct {
-	PairID  string
-	Outcome string // "yes" or "no"
+	PairID   string
+	Outcome  string // "yes" or "no"
+	Category string // "sports" or "crypto"
 }
 
 // PairMapping tells the WS client which token IDs belong to which arb pair.
 type PairMapping struct {
-	PairID      string
-	YesTokenID  string
-	NoTokenID   string
+	PairID     string
+	YesTokenID string
+	NoTokenID  string
+	Category   string // "sports" (default) or "crypto"
 }
 
 // NewWSClient creates a WebSocket client for the given resolved markets.
@@ -61,8 +63,8 @@ func NewWSClient(markets []ResolvedMarket, updates chan<- arb.PriceUpdate, pairM
 
 	tokenToPair := make(map[string]tokenPairInfo)
 	for _, pm := range pairMappings {
-		tokenToPair[pm.YesTokenID] = tokenPairInfo{PairID: pm.PairID, Outcome: "yes"}
-		tokenToPair[pm.NoTokenID] = tokenPairInfo{PairID: pm.PairID, Outcome: "no"}
+		tokenToPair[pm.YesTokenID] = tokenPairInfo{PairID: pm.PairID, Outcome: "yes", Category: pm.Category}
+		tokenToPair[pm.NoTokenID] = tokenPairInfo{PairID: pm.PairID, Outcome: "no", Category: pm.Category}
 	}
 
 	return &WSClient{
@@ -98,23 +100,28 @@ func (w *WSClient) Connect() error {
 		filter,
 		func(ob polymarketrealtime.AggOrderbook) error {
 			bestAsk := decimal.NewFromInt(999)
+			var bestAskSize decimal.Decimal
 			for _, a := range ob.Asks {
 				if a.Price.LessThan(bestAsk) {
 					bestAsk = a.Price
+					bestAskSize = a.Size
 				}
 			}
 			cents := bestAsk.Mul(decimal.NewFromInt(100))
-			log.Printf("[POLY book]  %-40s | buy @ %s¢ | asks: %d levels",
-				w.label(ob.AssetID), cents.StringFixed(1), len(ob.Asks))
+			log.Printf("[POLY book]  %-40s | buy @ %s¢ | qty: %s | asks: %d levels",
+				w.label(ob.AssetID), cents.StringFixed(1), bestAskSize.StringFixed(0), len(ob.Asks))
 
 			// Push to arb detector if this token is in a pair
 			if info, ok := w.tokenToPair[ob.AssetID]; ok && w.updates != nil {
 				askF, _ := bestAsk.Float64()
+				qtyF, _ := bestAskSize.Float64()
 				w.updates <- arb.PriceUpdate{
 					PairID:   info.PairID,
 					Exchange: "poly",
 					Outcome:  info.Outcome,
 					AskPrice: askF,
+					AskQty:   qtyF,
+					Category: info.Category,
 				}
 			}
 			return nil
@@ -144,6 +151,7 @@ func (w *WSClient) Connect() error {
 						Exchange: "poly",
 						Outcome:  info.Outcome,
 						AskPrice: askF,
+						Category: info.Category,
 					}
 				}
 			}
