@@ -5,6 +5,7 @@ polymarket:
   watchlist_path: "config/markets.yaml"
   api_key: ""
   api_secret: ""
+  passphrase: ""
 
 gemini:
   base_url: "https://api.gemini.com/v1/prediction-markets"
