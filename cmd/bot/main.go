@@ -4,13 +4,17 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/gemini"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/polymarket"
+	_ "github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
 
 func main() {
@@ -86,6 +90,15 @@ func main() {
 	if len(polyResolved) == 0 && len(geminiResolved) == 0 {
 		log.Fatal("no markets resolved on either exchange")
 	}
+
+	// Prometheus metrics endpoint
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("metrics server listening on :9090")
+		if err := http.ListenAndServe(":9090", nil); err != nil {
+			log.Printf("metrics server error: %v", err)
+		}
+	}()
 
 	log.Println("listening for updates... (Ctrl+C to stop)")
 
