@@ -10,26 +10,30 @@ The LightGBM model is loaded once at startup from artifacts/model.txt.
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import lightgbm as lgb
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from calibration_utils import apply_calibration, load_calibration
+
 
 _model: Optional[lgb.Booster] = None
 _feature_names: list[str] = []
+_calibrator: Optional[dict[str, Any]] = None
 
 ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _model, _feature_names
+    global _model, _feature_names, _calibrator
 
     model_path = ARTIFACTS_DIR / "model.txt"
     meta_path = ARTIFACTS_DIR / "model_meta.json"
+    cal_path = ARTIFACTS_DIR / "calibration.json"
 
     if not model_path.exists():
         print(f"WARNING: {model_path} not found — /predict will return 503 until a model is trained")
@@ -43,6 +47,13 @@ async def lifespan(app: FastAPI):
             meta = json.load(f)
         _feature_names = meta.get("feature_names", [])
         print(f"Feature names: {_feature_names}")
+
+    _calibrator = load_calibration(cal_path)
+    if _calibrator:
+        m = _calibrator.get("method", "?")
+        print(f"Loaded {m} calibrator from {cal_path} — /predict returns calibrated P(Yes)")
+    else:
+        print("No calibration.json — /predict returns raw booster probabilities")
 
     yield
 
@@ -87,7 +98,8 @@ def predict(req: PredictRequest) -> PredictResponse:
         getattr(req, name, 0.0) for name in _feature_names
     ]])
 
-    prob_yes = float(_model.predict(features)[0])
+    raw_yes = float(_model.predict(features)[0])
+    prob_yes = float(apply_calibration(np.array([raw_yes]), _calibrator)[0])
     prob_no = 1.0 - prob_yes
 
     edge_yes = prob_yes - req.current_price

@@ -2,8 +2,11 @@
 Train a LightGBM binary classifier to predict market resolution (YES=1 / NO=0).
 
 Usage:
-    python train.py                                # defaults
-    python train.py --input data/features.parquet --artifacts python/ml/artifacts
+    python train.py
+    python train.py --input data/features.parquet --calibration-mode auto_oof
+
+Post-hoc calibration uses time-series OOF predictions on the train split, then
+applies the map at serve time. Default mode is isotonic (see --calibration-mode).
 """
 
 import argparse
@@ -16,6 +19,44 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
+
+from calibration_utils import (
+    apply_calibration,
+    fit_isotonic_scaler,
+    fit_temperature_scaler,
+    pick_best_calibrator,
+    pick_calibrator_via_validation,
+    save_calibration,
+)
+
+
+def time_series_oof_predictions(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_cols: list[str],
+    params: dict,
+    num_trees: int,
+    n_splits: int = 5,
+) -> np.ndarray:
+    """
+    Out-of-fold predictions on the training set (time-ordered).
+    Used to fit calibration without using the tiny validation slice only.
+    """
+    oof = np.zeros(len(X), dtype=float)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    for tr_idx, va_idx in tscv.split(X):
+        if len(tr_idx) < 25:
+            oof[va_idx] = float(np.mean(y))
+            continue
+        dtr = lgb.Dataset(X[tr_idx], label=y[tr_idx], feature_name=feature_cols)
+        fold_model = lgb.train(
+            {**params, "verbose": -1},
+            dtr,
+            num_boost_round=max(1, num_trees),
+        )
+        oof[va_idx] = fold_model.predict(X[va_idx])
+    return oof
 
 FEATURE_COLS = [
     "current_price",
@@ -113,6 +154,32 @@ def main():
     parser.add_argument("--artifacts", default=str(repo_root / "python" / "ml" / "artifacts"))
     parser.add_argument("--train-frac", type=float, default=0.7)
     parser.add_argument("--val-frac", type=float, default=0.15)
+    parser.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="Skip post-hoc calibration; use raw LightGBM probabilities only",
+    )
+    parser.add_argument(
+        "--cal-oof-splits",
+        type=int,
+        default=5,
+        help="TimeSeriesSplit folds for OOF predictions used to fit the calibrator (default: 5)",
+    )
+    parser.add_argument(
+        "--cal-isotonic",
+        action="store_true",
+        help="Allow isotonic calibration (can tie-collapse probs; default: Platt+temperature only)",
+    )
+    parser.add_argument(
+        "--calibration-mode",
+        choices=["auto_oof", "auto", "temperature", "isotonic", "none"],
+        default="isotonic",
+        help=(
+            "isotonic = OOF isotonic map (default; good log loss/Brier on small data); "
+            "auto_oof = pick raw/temp/(iso if --cal-isotonic) by OOF log loss; "
+            "auto = choose vs raw on validation; temperature = OOF T only; none = raw"
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.artifacts, exist_ok=True)
@@ -152,17 +219,19 @@ def main():
     train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_cols)
     val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_cols, reference=train_data)
 
+    # Regularized booster: shallower trees + larger leaves reduce extreme raw probs
+    # on small tabular data (helps both raw scores and any post-hoc map).
     params = {
         "objective": "binary",
         "metric": "binary_logloss",
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "max_depth": 6,
-        "min_child_samples": 5,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
+        "learning_rate": 0.035,
+        "num_leaves": 15,
+        "max_depth": 4,
+        "min_child_samples": 25,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "reg_alpha": 0.4,
+        "reg_lambda": 1.5,
         "verbose": -1,
         "seed": 42,
     }
@@ -186,9 +255,96 @@ def main():
     prices_val = val_df["current_price"].fillna(0.5).values
     prices_test = test_df["current_price"].fillna(0.5).values
 
-    evaluate(y_train, model.predict(X_train), prices_train, "Train")
-    val_metrics = evaluate(y_val, model.predict(X_val), prices_val, "Validation")
-    test_metrics = evaluate(y_test, model.predict(X_test), prices_test, "Test")
+    pred_train = model.predict(X_train)
+    pred_val = model.predict(X_val)
+    pred_test = model.predict(X_test)
+
+    evaluate(y_train, pred_train, prices_train, "Train (raw)")
+    evaluate(y_val, pred_val, prices_val, "Validation (raw)")
+
+    cal_path = os.path.join(args.artifacts, "calibration.json")
+    calibrator = None
+    if not args.no_calibration and args.calibration_mode != "none":
+        n_trees = model.num_trees()
+        print(
+            f"\nFitting calibrator on time-series OOF train predictions "
+            f"({args.cal_oof_splits} folds, {n_trees} trees per fold)..."
+        )
+        oof_train = time_series_oof_predictions(
+            X_train,
+            y_train,
+            feature_cols,
+            params,
+            n_trees,
+            n_splits=args.cal_oof_splits,
+        )
+        if args.calibration_mode == "temperature":
+            calibrator = fit_temperature_scaler(oof_train, y_train)
+            if calibrator:
+                save_calibration(Path(cal_path), calibrator)
+                print(
+                    f"Saved OOF temperature calibrator (T={calibrator['temperature']:.4f}) to {cal_path}"
+                )
+            else:
+                print("WARNING: Could not fit temperature on OOF; using raw probabilities.")
+        elif args.calibration_mode == "isotonic":
+            calibrator = fit_isotonic_scaler(oof_train, y_train)
+            if calibrator:
+                save_calibration(Path(cal_path), calibrator)
+                print(f"Saved OOF isotonic calibrator to {cal_path}")
+            else:
+                print("WARNING: Could not fit isotonic on OOF; using raw probabilities.")
+        elif args.calibration_mode == "auto_oof":
+            calibrator = pick_best_calibrator(
+                oof_train, y_train, include_isotonic=args.cal_isotonic
+            )
+            if calibrator:
+                save_calibration(Path(cal_path), calibrator)
+                print(
+                    f"Saved calibrator ({calibrator['method']}) to {cal_path} "
+                    "(OOF log loss / Brier vs raw)"
+                )
+            else:
+                print("Calibration skipped (auto_oof): raw best on OOF.")
+                stale = Path(cal_path)
+                if stale.exists():
+                    stale.unlink()
+                    print(f"Removed {cal_path} so serve uses raw probabilities")
+        else:
+            calibrator = pick_calibrator_via_validation(
+                oof_train,
+                y_train,
+                pred_val,
+                y_val,
+                include_isotonic=args.cal_isotonic,
+            )
+            if calibrator:
+                save_calibration(Path(cal_path), calibrator)
+                print(
+                    f"Saved calibrator ({calibrator['method']}) to {cal_path} "
+                    "(OOF fit; chosen vs raw by validation log loss / Brier)"
+                )
+            else:
+                print("Calibration skipped (auto): raw best on validation.")
+                stale = Path(cal_path)
+                if stale.exists():
+                    stale.unlink()
+                    print(f"Removed {cal_path} so serve uses raw probabilities")
+
+        if calibrator:
+            pred_val_cal = apply_calibration(pred_val, calibrator)
+            pred_test_cal = apply_calibration(pred_test, calibrator)
+            evaluate(y_val, pred_val_cal, prices_val, "Validation (calibrated)")
+            evaluate(y_test, pred_test, prices_test, "Test (raw, for comparison)")
+            test_metrics = evaluate(y_test, pred_test_cal, prices_test, "Test (calibrated)")
+        else:
+            test_metrics = evaluate(y_test, pred_test, prices_test, "Test (raw)")
+    else:
+        test_metrics = evaluate(y_test, pred_test, prices_test, "Test (raw)")
+        stale_cal = Path(cal_path)
+        if stale_cal.exists():
+            stale_cal.unlink()
+            print(f"Removed {cal_path} (--no-calibration or --calibration-mode none)")
 
     # Feature importance
     importance = sorted(
@@ -209,18 +365,30 @@ def main():
         "feature_names": feature_cols,
         "params": params,
         "num_boost_round": model.best_iteration,
-        "val_metrics": val_metrics,
         "test_metrics": test_metrics,
+        "calibration": (
+            calibrator["method"]
+            if calibrator
+            else (
+                "none"
+                if args.no_calibration or args.calibration_mode == "none"
+                else "raw_best"
+            )
+        ),
+        "calibration_mode": args.calibration_mode,
     }
     meta_path = os.path.join(args.artifacts, "model_meta.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"Saved metadata to {meta_path}")
 
-    # Calibration plot
+    # Calibration plot (prefer calibrated curve when available)
+    plot_probs = pred_test
+    if calibrator is not None:
+        plot_probs = apply_calibration(pred_test, calibrator)
     save_calibration_plot(
         y_test,
-        model.predict(X_test),
+        plot_probs,
         os.path.join(args.artifacts, "calibration.png"),
     )
 

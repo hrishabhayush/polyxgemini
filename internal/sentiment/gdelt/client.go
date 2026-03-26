@@ -30,7 +30,7 @@ type Client struct {
 func NewClient(cfg config.SentimentConfig) *Client {
 	return &Client{
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 

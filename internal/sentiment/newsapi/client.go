@@ -47,7 +47,7 @@ func (c *Client) FetchHeadlines(ctx context.Context, keywords string, maxResults
 		return nil, ErrNoAPIKey
 	}
 
-	from := time.Now().UTC().AddDate(0, 0, -7).Format("2006-01-02")
+	from := time.Now().UTC().AddDate(0, 0, 100).Format("2006-01-02")
 
 	params := url.Values{}
 	params.Set("q", keywords)

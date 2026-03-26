@@ -25,3 +25,8 @@ data/*.parquet
 python/ml/artifacts/model.txt
 python/ml/artifacts/model_meta.json
 python/ml/artifacts/calibration.png
+
+.venv-ocr/
+__pycache__/
+*.pyc
+python/ml/artifacts/
