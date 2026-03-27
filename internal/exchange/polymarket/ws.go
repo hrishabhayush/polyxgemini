@@ -42,6 +42,7 @@ func NewWSClient(markets []ResolvedMarket, updates chan<- arb.PriceUpdate, pairM
 	client := polymarketrealtime.New(
 		polymarketrealtime.WithAutoReconnect(true),
 		polymarketrealtime.WithPingInterval(10*time.Second),
+		polymarketrealtime.WithReadTimeout(120*time.Second),
 		polymarketrealtime.WithOnConnect(func() {
 			log.Println("polymarket ws: connected")
 			metrics.WSConnected.WithLabelValues("polymarket").Set(1)

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -201,7 +202,7 @@ func main() {
 
 	// Start Gemini WS
 	if len(allGeminiEvents) > 0 {
-		geminiWS := gemini.NewWSClient(cfg.Gemini.WSURL, allGeminiEvents, updates, geminiPairMappings)
+		geminiWS := gemini.NewWSClient(cfg.Gemini, allGeminiEvents, updates, geminiPairMappings)
 		if err := geminiWS.Connect(); err != nil {
 			log.Printf("WARN: gemini ws failed: %v", err)
 		} else {
@@ -223,6 +224,9 @@ func main() {
 		}
 	}()
 
+	// Start Prometheus + Grafana via docker-compose
+	startObservability()
+
 	log.Println("listening for updates... (Ctrl+C to stop)")
 
 	sig := make(chan os.Signal, 1)
@@ -232,5 +236,28 @@ func main() {
 		log.Println("shutting down (signal)...")
 	case <-ctx.Done():
 		log.Printf("shutting down (budget exhausted: spent $%.2f)...", budgetTracker.Spent())
+	}
+
+	stopObservability()
+}
+
+func startObservability() {
+	cmd := exec.Command("docker", "compose", "up", "-d")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("WARN: docker compose up failed: %v (dashboards won't be available)", err)
+		return
+	}
+	log.Println("[observability] prometheus + grafana started (grafana at http://localhost:3000)")
+}
+
+func stopObservability() {
+	log.Println("[observability] stopping prometheus + grafana...")
+	cmd := exec.Command("docker", "compose", "down")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("WARN: docker compose down failed: %v", err)
 	}
 }

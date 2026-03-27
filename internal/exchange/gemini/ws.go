@@ -1,15 +1,22 @@
 package gemini
 
 import (
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/hrishabhayush/polyxgemini/internal/arb"
+	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
 
@@ -29,6 +36,7 @@ type BookTicker struct {
 // WSClient connects to Gemini WebSocket for prediction market data.
 type WSClient struct {
 	wsURL        string
+	cfg          config.GeminiConfig
 	conn         *websocket.Conn
 	markets      []ResolvedEvent
 	symbolLabels map[string]string
@@ -54,7 +62,8 @@ type PairMapping struct {
 }
 
 // NewWSClient creates a Gemini WS client for the given resolved events.
-func NewWSClient(wsURL string, markets []ResolvedEvent, updates chan<- arb.PriceUpdate, pairMappings []PairMapping) *WSClient {
+func NewWSClient(cfg config.GeminiConfig, markets []ResolvedEvent, updates chan<- arb.PriceUpdate, pairMappings []PairMapping) *WSClient {
+	wsURL := cfg.WSURL
 	if wsURL == "" {
 		wsURL = defaultWSURL
 	}
@@ -80,6 +89,7 @@ func NewWSClient(wsURL string, markets []ResolvedEvent, updates chan<- arb.Price
 
 	return &WSClient{
 		wsURL:        wsURL,
+		cfg:          cfg,
 		markets:      markets,
 		symbolLabels: labels,
 		symbolToPair: symbolToPair,
@@ -95,21 +105,37 @@ func (w *WSClient) label(symbol string) string {
 	return symbol
 }
 
-// Connect establishes the WS connection and subscribes to bookTicker for all contracts.
+// Connect establishes the authenticated WS connection and subscribes to bookTicker for all contracts.
 func (w *WSClient) Connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(w.wsURL, nil)
+	// Build auth headers for the handshake
+	nonce := strconv.FormatInt(time.Now().Unix(), 10)
+	b64Payload := base64.StdEncoding.EncodeToString([]byte(nonce))
+	mac := hmac.New(sha512.New384, []byte(w.cfg.APISecret))
+	mac.Write([]byte(b64Payload))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	headers := http.Header{}
+	headers.Set("X-GEMINI-APIKEY", w.cfg.APIKey)
+	headers.Set("X-GEMINI-NONCE", nonce)
+	headers.Set("X-GEMINI-PAYLOAD", b64Payload)
+	headers.Set("X-GEMINI-SIGNATURE", sig)
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	conn, _, err := dialer.Dial(w.wsURL, headers)
 	if err != nil {
 		return fmt.Errorf("gemini ws dial failed: %w", err)
 	}
 	w.conn = conn
-	log.Println("gemini ws: connected")
+	log.Println("gemini ws: connected (authenticated)")
 	metrics.WSConnected.WithLabelValues("gemini").Set(1)
 
 	// Subscribe to bookTicker for each contract
 	var streams []string
 	for _, m := range w.markets {
 		for _, c := range m.Contracts {
-			streams = append(streams, strings.ToLower(c.InstrumentSymbol)+"@bookTicker")
+			streams = append(streams, c.InstrumentSymbol+"@bookTicker")
 		}
 	}
 
@@ -152,7 +178,7 @@ func (w *WSClient) readLoop() {
 			continue
 		}
 
-		label := w.label(bt.Symbol)
+		label := w.label(strings.ToLower(bt.Symbol))
 		log.Printf("[GEMI book]  %-40s | buy @ %s¢ | ask_qty: %s",
 			label, centsFromDecimal(bt.BestAsk), bt.AskQty)
 
@@ -165,7 +191,7 @@ func (w *WSClient) readLoop() {
 		metrics.BookBestBid.WithLabelValues("gemini", bt.Symbol).Set(bidF * 100)
 
 		// Push to arb detector if this symbol is in a pair
-		if info, ok := w.symbolToPair[bt.Symbol]; ok && w.updates != nil {
+		if info, ok := w.symbolToPair[strings.ToLower(bt.Symbol)]; ok && w.updates != nil {
 			w.updates <- arb.PriceUpdate{
 				PairID:   info.PairID,
 				Exchange: "gemini",
