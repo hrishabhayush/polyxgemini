@@ -1,7 +1,7 @@
-# ML Pipeline — Market Resolution Predictor
+# ML Pipeline — Basketball In-Game Win Probability
 
-Predicts whether a Polymarket binary (YES/NO) market will resolve YES, using
-LightGBM trained on historical resolved markets.
+Predicts P(home team wins) at every minute of an NCAA March Madness game,
+using LightGBM trained on play-by-play state + Polymarket price/trade features.
 
 Run all commands from the **repo root** unless noted otherwise.
 
@@ -11,30 +11,49 @@ Run all commands from the **repo root** unless noted otherwise.
 
 ```bash
 source .venv-ocr/bin/activate
-pip install -U pandas numpy scikit-learn lightgbm pyarrow fastapi uvicorn optuna
+pip install -U -r python/ml/requirements.txt
+pip install optuna  # optional, for hyperparameter tuning
 ```
 
 ---
 
-## 1. Build feature table from resolved snapshots
+## 1. Fetch game data (NCAA PBP + Polymarket)
 
-Requires `data/snapshots/resolved_*.jsonl` to exist.
+Downloads play-by-play and market data for all March Madness tournament games.
+
+```bash
+python python/ml/fetch_games.py
+```
+
+Options:
+```bash
+python python/ml/fetch_games.py --start 2026-03-13 --end 2026-03-27 --out data/games
+```
+
+Output: `data/games/{gameId}.json` (one file per game)
+
+---
+
+## 2. Build feature table
+
+Replays each game's PBP, resamples to 1-minute intervals, merges Polymarket
+price/trade features at each timestamp.
 
 ```bash
 python python/ml/load_features.py
 ```
 
-Output: `data/features.parquet`
+Output: `data/features_basketball.parquet`
 
 ---
 
-## 2. Train the model
+## 3. Train the model
 
 ```bash
 python python/ml/train.py
 ```
 
-With Optuna hyperparameter search (~80 trials, takes a few minutes):
+With Optuna hyperparameter search:
 
 ```bash
 python python/ml/train.py --tune --tune-trials 80
@@ -47,23 +66,17 @@ Artifacts written to `python/ml/artifacts/`:
 
 ---
 
-## 3. Evaluate on held-out test data
+## 4. Evaluate on held-out test games
 
-Shows per-market predictions vs actual outcomes for the last 15% of resolved markets.
+Shows accuracy by time-remaining bucket and per-game predictions.
 
 ```bash
 python python/ml/eval_test.py
 ```
 
-Filter to only high-confidence calls:
-
-```bash
-python python/ml/eval_test.py --min-edge 0.3
-```
-
 ---
 
-## 4. Start the prediction server
+## 5. Start the prediction server
 
 Run in a dedicated terminal (keep it running):
 
@@ -73,75 +86,131 @@ source ../../.venv-ocr/bin/activate
 uvicorn serve:app --host 127.0.0.1 --port 8766
 ```
 
----
+### Prediction API
 
-## 5. Predict a specific market (with reasoning)
+**POST /predict**
 
-Look up any market by slug, URL, or search query and get a full prediction report.
-**Requires the server from Step 4 to be running.**
-
-```bash
-# By slug
-go run ./cmd/predict -market "will-the-iranian-regime-fall-by-june-30"
-
-# By search query
-go run ./cmd/predict -market "will bitcoin hit 100k by june"
-
-# By Polymarket URL
-go run ./cmd/predict -market "https://polymarket.com/event/will-trump-visit-china-by-april-30"
+```json
+{
+  "time_remaining_sec": 600,
+  "period": 2,
+  "score_diff": 5,
+  "scoring_run_60s": 3,
+  "scoring_run_120s": 7,
+  "lead_changes_so_far": 4,
+  "largest_lead": 12,
+  "momentum": 3.5,
+  "seed_diff": -3,
+  "poly_price": 0.65,
+  "poly_price_drift_5m": 0.02,
+  "poly_volume_1m": 500,
+  "poly_buy_fraction_5m": 0.6,
+  "poly_trade_count_5m": 15,
+  "has_poly": 1
+}
 ```
 
-Output includes: model probability, edge vs crowd price, signal strength, and
-per-feature reasoning (VPIN, buy pressure, Hurst, wallet concentration, etc.).
+Response:
+```json
+{
+  "prob_home_win": 0.7234,
+  "prob_away_win": 0.2766,
+  "edge_vs_market": 0.0734,
+  "model_side": "HOME"
+}
+```
 
 ---
 
-## 6. Score all live markets
+## 6. Predict a single live game
 
-Fetches the latest active snapshot and scores every binary market against the model.
+Run this while the server is up to fetch NCAA state (+ optional Polymarket),
+build one aligned feature snapshot, and call `/predict`.
 
 ```bash
-# First get a fresh snapshot (run once, takes ~30 min for 100 markets)
-go run ./cmd/snapshot -max 100
+# By NCAA game id
+python python/ml/predict_live_game.py --game-id 6534602
 
-# Then score (server must be running)
-python python/ml/score_live.py
+# By date + team hints (resolves game id from scoreboard)
+python python/ml/predict_live_game.py --date 2026-03-20 --away UCF --home UCLA --require-bracket
+
+# From an existing saved game JSON (offline NCAA/Poly fetch path)
+python python/ml/predict_live_game.py --from-json data/games/6534602.json
+
+# Skip Polymarket and predict from NCAA game state only
+python python/ml/predict_live_game.py --game-id 6534602 --no-poly
 ```
 
-Output: top 15 markets ranked by edge, filtered to trade_count ≥ 50 and volume ≥ $5000.
+Optional:
+
+```bash
+python python/ml/predict_live_game.py --game-id 6534602 --server http://127.0.0.1:8766 --poly-slug cbb-ucf-ucla-2026-03-20
+```
 
 ---
 
 ## Retraining workflow
 
-When you have new resolved market data:
+When new games are available:
 
 ```bash
-# 1. Export new resolved markets
-go run ./cmd/export -max 500 -lookback 365 -sentiment-window 1m
+# 1. Fetch new games
+python python/ml/fetch_games.py --start 2026-03-28 --end 2026-04-07
 
-# 2. Rebuild features
+# 2. Rebuild features (reads all data/games/*.json)
 python python/ml/load_features.py
 
 # 3. Retrain
 python python/ml/train.py --tune
 
 # 4. Restart the server
-# (Ctrl+C the running uvicorn, then re-run Step 4)
 ```
 
 ---
 
+## Feature reference
+
+### Game state (from NCAA PBP)
+| Feature | Description |
+|---|---|
+| `time_remaining_sec` | Seconds left in the game |
+| `period` | 1 (1st half), 2 (2nd half), 3+ (OT) |
+| `score_diff` | Home score minus away score |
+| `scoring_run_60s` | Net scoring run in last 60s of game clock |
+| `scoring_run_120s` | Net scoring run in last 120s |
+| `lead_changes_so_far` | Cumulative lead changes |
+| `largest_lead` | Max lead by either team so far |
+| `momentum` | EMA of recent scoring differential |
+| `seed_diff` | Home seed minus away seed |
+
+### Polymarket (matched by timestamp)
+| Feature | Description |
+|---|---|
+| `poly_price` | Moneyline price for home team |
+| `poly_price_drift_5m` | Price change over last 5 minutes |
+| `poly_volume_1m` | Trade volume in last 1 minute |
+| `poly_buy_fraction_5m` | Fraction of buys in last 5 minutes |
+| `poly_trade_count_5m` | Number of trades in last 5 minutes |
+| `has_poly` | 1 if Polymarket data available |
+
+### Derived
+| Feature | Description |
+|---|---|
+| `logit_poly_price` | Logit transform of poly_price |
+| `price_x_score_diff` | Interaction: poly_price * score_diff |
+| `time_x_score_diff` | Interaction: time_remaining * score_diff |
+
 ## File reference
 
 | File | Purpose |
-|---|---|
-| `load_features.py` | Builds `features.parquet` from resolved JSONL snapshots |
+|---|---|b
+| `fetch_games.py` | Downloads NCAA PBP + Polymarket data to `data/games/` |
+| `predict_live_game.py` | One-shot live inference: NCAA + Poly -> `/predict` |
+| `in_game_features.py` | Shared feature math for training/live parity |
+| `load_features.py` | Builds `features_basketball.parquet` from game JSONs |
 | `train.py` | Trains LightGBM model, saves artifacts |
 | `serve.py` | FastAPI prediction server |
-| `score_live.py` | Scores latest active snapshot, prints top edges |
-| `eval_test.py` | Evaluates model on held-out test set |
+| `eval_test.py` | Evaluates model on held-out test games |
 | `calibration_utils.py` | Calibration helpers (Platt, temperature, isotonic) |
 | `artifacts/model.txt` | Trained LightGBM model |
 | `artifacts/model_meta.json` | Feature names, hyperparams, test metrics |
-| `cmd/predict/main.go` | Go CLI for single-market prediction with reasoning |

@@ -1,9 +1,13 @@
 """
-Load JSONL snapshots exported by cmd/export and assemble a Parquet feature table.
+Build a minute-level feature table from NCAA play-by-play + Polymarket data.
+
+Reads data/games/*.json (produced by fetch_games.py), replays each game's
+play-by-play event stream, resamples to 1-minute game-clock intervals, merges
+Polymarket price/trade features, and writes data/features_basketball.parquet.
 
 Usage:
-    python load_features.py                           # defaults: data/snapshots -> data/features.parquet
-    python load_features.py --input data/snapshots --output data/features.parquet
+    python load_features.py
+    python load_features.py --input data/games --output data/features_basketball.parquet
 """
 
 import argparse
@@ -13,142 +17,80 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
+from in_game_features import (
+    add_derived_features,
+    merge_polymarket,
+    replay_game,
+    resample_to_minutes,
+)
 
-NUMERIC_FEATURES = [
-    "current_price",
-    "hurst_exp",
-    "vol_ratio",
-    "trade_count",
-    "total_volume",
-    "kyles_lambda",
-    "vpin",
-    "buy_fraction",
-    "wallet_hhi",
-    "article_count",
-    "bullish_score",
-    "bearish_score",
-    "resolution_reliability",
-]
-
-
-def load_jsonl_dir(input_dir: str) -> pd.DataFrame:
-    """Read all resolved_*.jsonl files and return a DataFrame."""
-    pattern = os.path.join(input_dir, "resolved_*.jsonl")
-    files = sorted(glob.glob(pattern))
-    if not files:
-        print(f"No resolved_*.jsonl files found in {input_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    rows = []
-    for path in files:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-
-    print(f"Loaded {len(rows)} rows from {len(files)} file(s)")
-    return pd.DataFrame(rows)
-
-
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute derived features on top of the raw exported columns."""
-    out = df.copy()
-
-    # Parse dates
-    for col in ("created_at", "end_date", "snapshot_at"):
-        if col in out.columns:
-            out[col] = pd.to_datetime(out[col], errors="coerce", utc=True)
-
-    # Binary label: 1 = Yes, 0 = No
-    out["label"] = (out["outcome"].str.lower() == "yes").astype(int)
-
-    # Sentiment net signal
-    out["sentiment_net"] = out["bullish_score"] - out["bearish_score"]
-
-    # Log volume (handles zero gracefully)
-    out["log_volume"] = np.log1p(out["total_volume"])
-
-    # Market age in days: prefer end_date - created_at; fall back to snapshot_at - created_at
-    if "created_at" in out.columns:
-        if "end_date" in out.columns:
-            end_ref = out["end_date"].fillna(out.get("snapshot_at"))
-        elif "snapshot_at" in out.columns:
-            end_ref = out["snapshot_at"]
-        else:
-            end_ref = None
-        if end_ref is not None:
-            out["market_age_days"] = (
-                (end_ref - out["created_at"]).dt.total_seconds() / 86400
-            ).clip(lower=0)
-        else:
-            out["market_age_days"] = np.nan
-    else:
-        out["market_age_days"] = np.nan
-
-    # Distance from maximum uncertainty (price = 0.5)
-    out["price_distance_from_50"] = (out["current_price"] - 0.5).abs()
-
-    # Encode categorical: jump_result -> ordinal
-    jump_map = {"no_jumps": 0, "reversed": 1, "sustained": 2}
-    out["jump_result_enc"] = out["jump_result"].map(jump_map).fillna(0).astype(int)
-
-    # Indicator: was hurst_exp actually computed (non-zero means we had enough trades)
-    out["has_hurst"] = (out["hurst_exp"].fillna(0) != 0).astype(int)
-
-    # Log trade count (better scaling than raw count for trees)
-    out["log_trade_count"] = np.log1p(out["trade_count"].fillna(0))
-
-    # Average trade size: captures institutional (large) vs retail (small) flow
-    out["avg_trade_size"] = out["total_volume"].fillna(0) / (out["trade_count"].fillna(0) + 1)
-    out["log_avg_trade_size"] = np.log1p(out["avg_trade_size"])
-
-    return out
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def main():
-    repo_root = Path(__file__).resolve().parents[2]
-
-    parser = argparse.ArgumentParser(description="Assemble ML feature table from JSONL snapshots")
-    parser.add_argument("--input", default=str(repo_root / "data" / "snapshots"),
-                        help="Directory containing resolved_*.jsonl files")
-    parser.add_argument("--output", default=str(repo_root / "data" / "features.parquet"),
+    parser = argparse.ArgumentParser(description="Build basketball feature table")
+    parser.add_argument("--input", default=str(REPO_ROOT / "data" / "games"),
+                        help="Directory containing game JSON files")
+    parser.add_argument("--output", default=str(REPO_ROOT / "data" / "features_basketball.parquet"),
                         help="Output Parquet path")
     args = parser.parse_args()
 
-    df = load_jsonl_dir(args.input)
-    df = engineer_features(df)
+    files = sorted(glob.glob(os.path.join(args.input, "*.json")))
+    if not files:
+        print(f"No game JSON files found in {args.input}", file=sys.stderr)
+        sys.exit(1)
 
-    # Drop rows without a valid outcome
-    before = len(df)
-    df = df.dropna(subset=["label"])
-    df = df[df["outcome"].isin(["Yes", "No", "yes", "no"])]
-    print(f"Kept {len(df)} / {before} rows with valid outcomes")
+    print(f"Processing {len(files)} game files...")
+    all_dfs = []
+    for path in files:
+        with open(path) as f:
+            record = json.load(f)
 
-    # Drop rows with no CLOB data — these are old markets where the API returned nothing.
-    # A row with current_price=0 AND trade_count=0 has zero signal for the model.
-    before = len(df)
-    has_price_data = (df["current_price"] != 0) | (df["trade_count"] != 0)
-    df = df[has_price_data]
-    dropped = before - len(df)
-    if dropped > 0:
-        print(f"Dropped {dropped} rows with no price/trade data (old markets with no CLOB history)")
+        meta = record.get("meta", {})
+        pbp = record.get("ncaa_pbp")
+        poly = record.get("polymarket", {})
 
-    # Sort by end_date for time-based splitting downstream
-    if "end_date" in df.columns:
-        df = df.sort_values("end_date").reset_index(drop=True)
+        if not pbp or not pbp.get("periods"):
+            print(f"  SKIP {meta.get('title', path)}: no play-by-play data")
+            continue
+
+        events = replay_game(pbp)
+        if len(events) < 5:
+            print(f"  SKIP {meta.get('title', path)}: too few events ({len(events)})")
+            continue
+
+        df = resample_to_minutes(events, meta)
+
+        game_start_epoch = 0.0
+        if poly.get("trades"):
+            timestamps = [float(t.get("timestamp", 0) or t.get("matchedAt", 0) or 0) for t in poly["trades"]]
+            if timestamps:
+                game_start_epoch = min(t for t in timestamps if t > 0) if any(t > 0 for t in timestamps) else 0
+
+        df = merge_polymarket(df, poly, game_start_epoch)
+        df = add_derived_features(df)
+        all_dfs.append(df)
+        poly_status = "with Poly" if poly.get("found") else "no Poly"
+        print(f"  {meta.get('title', '')}: {len(df)} minute-rows ({poly_status})")
+
+    if not all_dfs:
+        print("ERROR: No valid games processed", file=sys.stderr)
+        sys.exit(1)
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    if "game_date" in combined.columns:
+        combined = combined.sort_values(["game_date", "game_id", "time_remaining_sec"],
+                                        ascending=[True, True, False]).reset_index(drop=True)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    df.to_parquet(args.output, index=False)
-    print(f"Wrote {len(df)} rows x {len(df.columns)} cols to {args.output}")
-
-    # Summary
-    print("\nLabel distribution:")
-    print(df["label"].value_counts().to_string())
-    print(f"\nFeature columns: {sorted(df.columns.tolist())}")
+    combined.to_parquet(args.output, index=False)
+    print(f"\nWrote {len(combined)} rows x {len(combined.columns)} cols to {args.output}")
+    print(f"Games: {combined['game_id'].nunique()}")
+    print(f"Label distribution:\n{combined['label'].value_counts().to_string()}")
+    print(f"Poly coverage: {(combined['has_poly'] == 1).sum()} / {len(combined)} rows")
 
 
 if __name__ == "__main__":

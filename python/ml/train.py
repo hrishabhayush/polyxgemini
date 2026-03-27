@@ -1,12 +1,12 @@
 """
-Train a LightGBM binary classifier to predict market resolution (YES=1 / NO=0).
+Train a LightGBM binary classifier to predict basketball game outcomes.
+
+Predicts P(home team wins) at each minute of game time, using NCAA play-by-play
+state features and Polymarket price/trade features.
 
 Usage:
     python train.py
-    python train.py --input data/features.parquet --calibration-mode auto_oof
-
-Post-hoc calibration uses time-series OOF predictions on the train split, then
-applies the map at serve time. Default mode is isotonic (see --calibration-mode).
+    python train.py --input data/features_basketball.parquet --tune --tune-trials 80
 """
 
 import argparse
@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import calibration_curve
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import GroupKFold
 
 try:
     import optuna
@@ -37,22 +37,76 @@ from calibration_utils import (
     save_calibration,
 )
 
+BASE_FEATURE_COLS = [
+    "time_remaining_sec",
+    "log_time_remaining",
+    "period",
+    "score_diff",
+    "abs_score_diff",
+    "scoring_run_60s",
+    "scoring_run_120s",
+    "lead_changes_so_far",
+    "largest_lead",
+    "momentum",
+    "seed_diff",
+    "poly_price",
+    "poly_price_drift_5m",
+    "poly_volume_1m",
+    "poly_buy_fraction_5m",
+    "poly_trade_count_5m",
+    "has_poly",
+]
 
-def time_series_oof_predictions(
+INTERACTION_COLS = [
+    "price_x_score_diff",
+    "time_x_score_diff",
+    "logit_poly_price",
+]
+
+
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive interaction / nonlinear features from base columns."""
+    df = df.copy()
+    eps = 1e-6
+    p = df["poly_price"].clip(eps, 1.0 - eps)
+    df["logit_poly_price"] = np.log(p / (1.0 - p))
+    df["price_x_score_diff"] = df["poly_price"] * df["score_diff"]
+    df["time_x_score_diff"] = df["time_remaining_sec"] * df["score_diff"]
+    return df
+
+
+def game_date_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 0.15):
+    """Split by game date, keeping all rows from a game in the same split."""
+    game_dates = df.groupby("game_id")["game_date"].first().sort_values()
+    unique_games = game_dates.index.tolist()
+    n = len(unique_games)
+    train_end = int(n * train_frac)
+    val_end = int(n * (train_frac + val_frac))
+
+    train_games = set(unique_games[:train_end])
+    val_games = set(unique_games[train_end:val_end])
+    test_games = set(unique_games[val_end:])
+
+    return (
+        df[df["game_id"].isin(train_games)].copy(),
+        df[df["game_id"].isin(val_games)].copy(),
+        df[df["game_id"].isin(test_games)].copy(),
+    )
+
+
+def game_oof_predictions(
     X: np.ndarray,
     y: np.ndarray,
+    groups: np.ndarray,
     feature_cols: list[str],
     params: dict,
     num_trees: int,
     n_splits: int = 5,
 ) -> np.ndarray:
-    """
-    Out-of-fold predictions on the training set (time-ordered).
-    Used to fit calibration without using the tiny validation slice only.
-    """
+    """Out-of-fold predictions using GroupKFold (no game leakage)."""
     oof = np.zeros(len(X), dtype=float)
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    for tr_idx, va_idx in tscv.split(X):
+    gkf = GroupKFold(n_splits=min(n_splits, len(np.unique(groups))))
+    for tr_idx, va_idx in gkf.split(X, y, groups):
         if len(tr_idx) < 25:
             oof[va_idx] = float(np.mean(y))
             continue
@@ -64,55 +118,6 @@ def time_series_oof_predictions(
         )
         oof[va_idx] = fold_model.predict(X[va_idx])
     return oof
-
-BASE_FEATURE_COLS = [
-    "current_price",
-    "hurst_exp",
-    "has_hurst",
-    "vol_ratio",
-    "jump_result_enc",
-    "trade_count",
-    "log_trade_count",
-    "total_volume",
-    "log_volume",
-    "avg_trade_size",
-    "log_avg_trade_size",
-    "kyles_lambda",
-    "vpin",
-    "buy_fraction",
-    "wallet_hhi",
-    "market_age_days",
-    "price_distance_from_50",
-]
-
-INTERACTION_COLS = [
-    "price_x_log_volume",
-    "price_x_hhi",
-    "price_x_vpin",
-    "price_x_buy_fraction",
-    "hhi_x_buy_fraction",
-    "vpin_x_log_kyles",
-    "log_trade_x_vpin",
-    "logit_price",
-]
-
-
-def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Derive interaction / nonlinear features from base columns."""
-    df = df.copy()
-    eps = 1e-6
-    df["price_x_log_volume"] = df["current_price"] * df["log_volume"]
-    df["price_x_hhi"] = df["current_price"] * df["wallet_hhi"]
-    df["price_x_vpin"] = df["current_price"] * df["vpin"]
-    df["price_x_buy_fraction"] = df["current_price"] * df["buy_fraction"]
-    df["hhi_x_buy_fraction"] = df["wallet_hhi"] * df["buy_fraction"]
-    # Combined order-flow toxicity: VPIN × log(Kyle's lambda)
-    df["vpin_x_log_kyles"] = df["vpin"] * np.log1p(df["kyles_lambda"].abs())
-    # Volume-weighted VPIN
-    df["log_trade_x_vpin"] = df.get("log_trade_count", np.log1p(df["trade_count"])) * df["vpin"]
-    p = df["current_price"].clip(eps, 1.0 - eps)
-    df["logit_price"] = np.log(p / (1.0 - p))
-    return df
 
 
 def tune_blend_alpha(
@@ -131,17 +136,10 @@ def tune_blend_alpha(
     return round(float(best_alpha), 3)
 
 
-def time_based_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 0.15):
-    """Split by end_date: train | val | test."""
-    n = len(df)
-    train_end = int(n * train_frac)
-    val_end = int(n * (train_frac + val_frac))
-    return df.iloc[:train_end], df.iloc[train_end:val_end], df.iloc[val_end:]
-
-
 def evaluate(y_true: np.ndarray, y_prob: np.ndarray, prices: np.ndarray, split_name: str):
-    """Print classification and trading-relevant metrics."""
-    ll = log_loss(y_true, y_prob)
+    """Print classification metrics."""
+    y_prob_clipped = np.clip(y_prob, 1e-7, 1 - 1e-7)
+    ll = log_loss(y_true, y_prob_clipped)
     bs = brier_score_loss(y_true, y_prob)
     metrics = {"log_loss": round(ll, 4), "brier_score": round(bs, 4)}
 
@@ -149,24 +147,21 @@ def evaluate(y_true: np.ndarray, y_prob: np.ndarray, prices: np.ndarray, split_n
         auc = roc_auc_score(y_true, y_prob)
         metrics["auc"] = round(auc, 4)
 
-    # Simulated edge: for each market, edge on the correct side
-    # If outcome=YES (label=1), edge = model_prob_yes - market_price
-    # If outcome=NO  (label=0), edge = model_prob_no  - (1 - market_price)
+    accuracy = ((y_prob > 0.5) == y_true.astype(bool)).mean()
+    metrics["accuracy"] = round(float(accuracy), 4)
+
     edge_yes = y_prob - prices
     edge_no = (1 - y_prob) - (1 - prices)
     edge = np.where(y_true == 1, edge_yes, edge_no)
     metrics["mean_edge"] = round(float(np.mean(edge)), 4)
-    metrics["median_edge"] = round(float(np.median(edge)), 4)
-    metrics["pct_positive_edge"] = round(float(np.mean(edge > 0)) * 100, 1)
 
     print(f"\n--- {split_name} ---")
     for k, v in metrics.items():
         print(f"  {k}: {v}")
 
-    # Calibration: predicted prob vs observed freq in 10 bins
     try:
-        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy="quantile")
-        print(f"  calibration (pred -> actual):")
+        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=8, strategy="quantile")
+        print("  calibration (pred -> actual):")
         for mp, fp in zip(mean_pred, frac_pos):
             print(f"    {mp:.2f} -> {fp:.2f}")
     except ValueError:
@@ -176,13 +171,13 @@ def evaluate(y_true: np.ndarray, y_prob: np.ndarray, prices: np.ndarray, split_n
 
 
 def save_calibration_plot(y_true, y_prob, path):
-    """Save a calibration plot to disk (optional, fails gracefully)."""
+    """Save a calibration plot to disk."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy="quantile")
+        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=8, strategy="quantile")
         fig, ax = plt.subplots(figsize=(6, 6))
         ax.plot([0, 1], [0, 1], "k--", label="Perfect")
         ax.plot(mean_pred, frac_pos, "s-", label="Model")
@@ -200,15 +195,16 @@ def save_calibration_plot(y_true, y_prob, path):
 def tune_hyperparams(
     X: np.ndarray,
     y: np.ndarray,
+    groups: np.ndarray,
     feature_cols: list[str],
     n_trials: int = 60,
     n_splits: int = 5,
 ) -> dict:
-    """Optuna TPE search over LightGBM hyperparams using TimeSeriesSplit CV log loss."""
+    """Optuna search over LightGBM hyperparams using GroupKFold CV."""
     if not HAS_OPTUNA:
         raise RuntimeError("optuna not installed — run: pip install optuna")
 
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    gkf = GroupKFold(n_splits=min(n_splits, len(np.unique(groups))))
 
     def objective(trial):
         params = {
@@ -217,9 +213,9 @@ def tune_hyperparams(
             "verbose": -1,
             "seed": 42,
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 8, 31),
-            "max_depth": trial.suggest_int("max_depth", 3, 6),
-            "min_child_samples": trial.suggest_int("min_child_samples", 15, 60),
+            "num_leaves": trial.suggest_int("num_leaves", 8, 48),
+            "max_depth": trial.suggest_int("max_depth", 3, 7),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 50),
             "subsample": trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
@@ -227,7 +223,7 @@ def tune_hyperparams(
             "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.5),
         }
         scores = []
-        for tr_idx, va_idx in tscv.split(X):
+        for tr_idx, va_idx in gkf.split(X, y, groups):
             if len(tr_idx) < 25:
                 continue
             dtr = lgb.Dataset(X[tr_idx], label=y[tr_idx], feature_name=feature_cols)
@@ -255,47 +251,19 @@ def tune_hyperparams(
 def main():
     repo_root = Path(__file__).resolve().parents[2]
 
-    parser = argparse.ArgumentParser(description="Train LightGBM market resolution model")
-    parser.add_argument("--input", default=str(repo_root / "data" / "features.parquet"))
+    parser = argparse.ArgumentParser(description="Train basketball in-game forecaster")
+    parser.add_argument("--input", default=str(repo_root / "data" / "features_basketball.parquet"))
     parser.add_argument("--artifacts", default=str(repo_root / "python" / "ml" / "artifacts"))
     parser.add_argument("--train-frac", type=float, default=0.7)
     parser.add_argument("--val-frac", type=float, default=0.15)
-    parser.add_argument(
-        "--no-calibration",
-        action="store_true",
-        help="Skip post-hoc calibration; use raw LightGBM probabilities only",
-    )
-    parser.add_argument(
-        "--cal-oof-splits",
-        type=int,
-        default=5,
-        help="TimeSeriesSplit folds for OOF predictions used to fit the calibrator (default: 5)",
-    )
-    parser.add_argument(
-        "--cal-isotonic",
-        action="store_true",
-        help="Allow isotonic calibration (can tie-collapse probs; default: Platt+temperature only)",
-    )
-    parser.add_argument(
-        "--tune",
-        action="store_true",
-        help="Run Optuna hyperparameter search (requires: pip install optuna). ~60 trials.",
-    )
-    parser.add_argument(
-        "--tune-trials",
-        type=int,
-        default=60,
-        help="Number of Optuna trials (default: 60)",
-    )
+    parser.add_argument("--no-calibration", action="store_true")
+    parser.add_argument("--cal-oof-splits", type=int, default=5)
+    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--tune-trials", type=int, default=60)
     parser.add_argument(
         "--calibration-mode",
         choices=["auto_oof", "auto", "temperature", "isotonic", "none"],
         default="isotonic",
-        help=(
-            "isotonic = OOF isotonic map (default; good log loss/Brier on small data); "
-            "auto_oof = pick raw/temp/(iso if --cal-isotonic) by OOF log loss; "
-            "auto = choose vs raw on validation; temperature = OOF T only; none = raw"
-        ),
     )
     args = parser.parse_args()
 
@@ -303,6 +271,7 @@ def main():
 
     df = pd.read_parquet(args.input)
     print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
+    print(f"Games: {df['game_id'].nunique()}")
 
     df = add_interaction_features(df)
 
@@ -310,26 +279,28 @@ def main():
     available = [c for c in all_cols if c in df.columns]
     missing = [c for c in all_cols if c not in df.columns]
     if missing:
-        print(f"WARNING: missing feature columns (will be dropped): {missing}")
+        print(f"WARNING: missing feature columns: {missing}")
     feature_cols = available
 
     if "label" not in df.columns:
         print("ERROR: 'label' column not found. Run load_features.py first.")
         return
 
-    # Drop rows with all-NaN features
     df = df.dropna(subset=["label"])
     df[feature_cols] = df[feature_cols].fillna(0)
 
-    train_df, val_df, test_df = time_based_split(df, args.train_frac, args.val_frac)
-    print(f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+    train_df, val_df, test_df = game_date_split(df, args.train_frac, args.val_frac)
+    print(f"Split: train={len(train_df)} ({train_df['game_id'].nunique()} games), "
+          f"val={len(val_df)} ({val_df['game_id'].nunique()} games), "
+          f"test={len(test_df)} ({test_df['game_id'].nunique()} games)")
 
     if len(train_df) < 10:
-        print("ERROR: Not enough training data. Export more resolved markets first.")
+        print("ERROR: Not enough training data.")
         return
 
     X_train = train_df[feature_cols].values
     y_train = train_df["label"].values
+    groups_train = train_df["game_id"].values
     X_val = val_df[feature_cols].values
     y_val = val_df["label"].values
     X_test = test_df[feature_cols].values
@@ -338,19 +309,17 @@ def main():
     train_data = lgb.Dataset(X_train, label=y_train, feature_name=feature_cols)
     val_data = lgb.Dataset(X_val, label=y_val, feature_name=feature_cols, reference=train_data)
 
-    # Regularized booster: shallower trees + larger leaves reduce extreme raw probs
-    # on small tabular data (helps both raw scores and any post-hoc map).
     default_params = {
         "objective": "binary",
         "metric": "binary_logloss",
         "learning_rate": 0.03,
-        "num_leaves": 16,
-        "max_depth": 4,
-        "min_child_samples": 25,
-        "subsample": 0.75,
-        "colsample_bytree": 0.75,
-        "reg_alpha": 0.3,
-        "reg_lambda": 2.0,
+        "num_leaves": 24,
+        "max_depth": 5,
+        "min_child_samples": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.2,
+        "reg_lambda": 1.5,
         "min_split_gain": 0.05,
         "verbose": -1,
         "seed": 42,
@@ -358,16 +327,13 @@ def main():
 
     if args.tune:
         if not HAS_OPTUNA:
-            print("WARNING: --tune requested but optuna not installed. pip install optuna. Using defaults.")
+            print("WARNING: --tune requested but optuna not installed. Using defaults.")
             params = default_params
         else:
-            print(f"\nRunning Optuna HPO ({args.tune_trials} trials, {args.cal_oof_splits}-fold CV)...")
+            print(f"\nRunning Optuna HPO ({args.tune_trials} trials)...")
             params = tune_hyperparams(
-                train_df[feature_cols].values,
-                train_df["label"].values,
-                feature_cols,
-                n_trials=args.tune_trials,
-                n_splits=args.cal_oof_splits,
+                X_train, y_train, groups_train, feature_cols,
+                n_trials=args.tune_trials, n_splits=args.cal_oof_splits,
             )
     else:
         params = default_params
@@ -386,10 +352,9 @@ def main():
         callbacks=callbacks,
     )
 
-    # Evaluate on all splits
-    prices_train = train_df["current_price"].fillna(0.5).values
-    prices_val = val_df["current_price"].fillna(0.5).values
-    prices_test = test_df["current_price"].fillna(0.5).values
+    prices_train = train_df["poly_price"].fillna(0.5).values
+    prices_val = val_df["poly_price"].fillna(0.5).values
+    prices_test = test_df["poly_price"].fillna(0.5).values
 
     pred_train = model.predict(X_train)
     pred_val = model.predict(X_val)
@@ -403,133 +368,76 @@ def main():
     oof_train = None
     pred_val_cal = pred_val
     pred_test_cal = pred_test
+
     if not args.no_calibration and args.calibration_mode != "none":
         n_trees = model.num_trees()
-        print(
-            f"\nFitting calibrator on time-series OOF train predictions "
-            f"({args.cal_oof_splits} folds, {n_trees} trees per fold)..."
-        )
-        oof_train = time_series_oof_predictions(
-            X_train,
-            y_train,
-            feature_cols,
-            params,
-            n_trees,
+        print(f"\nFitting calibrator on GroupKFold OOF predictions "
+              f"({args.cal_oof_splits} folds, {n_trees} trees)...")
+        oof_train = game_oof_predictions(
+            X_train, y_train, groups_train, feature_cols, params, n_trees,
             n_splits=args.cal_oof_splits,
         )
         if args.calibration_mode == "temperature":
             calibrator = fit_temperature_scaler(oof_train, y_train)
-            if calibrator:
-                save_calibration(Path(cal_path), calibrator)
-                print(
-                    f"Saved OOF temperature calibrator (T={calibrator['temperature']:.4f}) to {cal_path}"
-                )
-            else:
-                print("WARNING: Could not fit temperature on OOF; using raw probabilities.")
         elif args.calibration_mode == "isotonic":
             calibrator = fit_isotonic_scaler(oof_train, y_train)
-            if calibrator:
-                save_calibration(Path(cal_path), calibrator)
-                print(f"Saved OOF isotonic calibrator to {cal_path}")
-            else:
-                print("WARNING: Could not fit isotonic on OOF; using raw probabilities.")
         elif args.calibration_mode == "auto_oof":
-            calibrator = pick_best_calibrator(
-                oof_train, y_train, include_isotonic=args.cal_isotonic
-            )
-            if calibrator:
-                save_calibration(Path(cal_path), calibrator)
-                print(
-                    f"Saved calibrator ({calibrator['method']}) to {cal_path} "
-                    "(OOF log loss / Brier vs raw)"
-                )
-            else:
-                print("Calibration skipped (auto_oof): raw best on OOF.")
-                stale = Path(cal_path)
-                if stale.exists():
-                    stale.unlink()
-                    print(f"Removed {cal_path} so serve uses raw probabilities")
+            calibrator = pick_best_calibrator(oof_train, y_train)
         else:
             calibrator = pick_calibrator_via_validation(
-                oof_train,
-                y_train,
-                pred_val,
-                y_val,
-                include_isotonic=args.cal_isotonic,
+                oof_train, y_train, pred_val, y_val,
             )
-            if calibrator:
-                save_calibration(Path(cal_path), calibrator)
-                print(
-                    f"Saved calibrator ({calibrator['method']}) to {cal_path} "
-                    "(OOF fit; chosen vs raw by validation log loss / Brier)"
-                )
-            else:
-                print("Calibration skipped (auto): raw best on validation.")
-                stale = Path(cal_path)
-                if stale.exists():
-                    stale.unlink()
-                    print(f"Removed {cal_path} so serve uses raw probabilities")
 
         if calibrator:
+            save_calibration(Path(cal_path), calibrator)
+            print(f"Saved {calibrator['method']} calibrator to {cal_path}")
             pred_val_cal = apply_calibration(pred_val, calibrator)
             pred_test_cal = apply_calibration(pred_test, calibrator)
             evaluate(y_val, pred_val_cal, prices_val, "Validation (calibrated)")
             evaluate(y_test, pred_test, prices_test, "Test (raw, for comparison)")
             test_metrics = evaluate(y_test, pred_test_cal, prices_test, "Test (calibrated)")
         else:
+            print("Calibration skipped — raw best.")
+            stale = Path(cal_path)
+            if stale.exists():
+                stale.unlink()
             test_metrics = evaluate(y_test, pred_test, prices_test, "Test (raw)")
     else:
         test_metrics = evaluate(y_test, pred_test, prices_test, "Test (raw)")
         stale_cal = Path(cal_path)
         if stale_cal.exists():
             stale_cal.unlink()
-            print(f"Removed {cal_path} (--no-calibration or --calibration-mode none)")
 
-    # --- Market-price blend ---
-    # The market price is already a probability estimate (the crowd).
-    # Blending model with market price reduces overconfidence.
+    # Blend with Polymarket price
     n_trees = model.num_trees()
     if oof_train is None:
-        print(
-            f"\nComputing OOF for blend alpha "
-            f"({args.cal_oof_splits} folds, {n_trees} trees)..."
-        )
-        oof_train = time_series_oof_predictions(
-            X_train, y_train, feature_cols, params, n_trees,
+        oof_train = game_oof_predictions(
+            X_train, y_train, groups_train, feature_cols, params, n_trees,
             n_splits=args.cal_oof_splits,
         )
 
-    oof_for_blend = oof_train
-    if calibrator:
-        oof_for_blend = apply_calibration(oof_train, calibrator)
-
-    oof_prices = train_df["current_price"].fillna(0.5).values
-    blend_alpha = tune_blend_alpha(oof_for_blend, oof_prices, y_train)
+    oof_for_blend = apply_calibration(oof_train, calibrator) if calibrator else oof_train
+    blend_alpha = tune_blend_alpha(oof_for_blend, prices_train, y_train)
     print(f"\nBlend alpha (tuned on OOF): {blend_alpha}")
-    print(f"  final_prob = {blend_alpha} * model + {1.0 - blend_alpha:.3f} * market_price")
+    print(f"  final_prob = {blend_alpha} * model + {1.0 - blend_alpha:.3f} * poly_price")
 
     if blend_alpha < 1.0:
         def final_pred(m, p):
             return blend_alpha * m + (1.0 - blend_alpha) * p
 
-        if calibrator:
-            pred_test_final = final_pred(pred_test_cal, prices_test)
-            pred_val_final = final_pred(pred_val_cal, prices_val)
-        else:
-            pred_test_final = final_pred(pred_test, prices_test)
-            pred_val_final = final_pred(pred_val, prices_val)
+        pred_test_final = final_pred(pred_test_cal if calibrator else pred_test, prices_test)
+        pred_val_final = final_pred(pred_val_cal if calibrator else pred_val, prices_val)
 
         evaluate(y_val, pred_val_final, prices_val, "Validation (blended)")
         blended_metrics = evaluate(y_test, pred_test_final, prices_test, "Test (blended)")
 
         if blended_metrics["brier_score"] < test_metrics["brier_score"]:
             test_metrics = blended_metrics
-            print("  -> Using blended as final (better Brier than calibrated/raw).")
+            print("  -> Using blended as final.")
         else:
             blend_alpha = 1.0
-            print("  -> Blend did not improve test Brier; using calibrated/raw (alpha=1.0).")
+            print("  -> Blend did not improve; using model only (alpha=1.0).")
 
-    # Feature importance
     importance = sorted(
         zip(feature_cols, model.feature_importance("gain")),
         key=lambda x: x[1],
@@ -539,7 +447,6 @@ def main():
     for name, imp in importance:
         print(f"  {name}: {imp:.1f}")
 
-    # Save artifacts
     model_path = os.path.join(args.artifacts, "model.txt")
     model.save_model(model_path)
     print(f"\nSaved model to {model_path}")
@@ -549,32 +456,18 @@ def main():
         "params": params,
         "num_boost_round": model.best_iteration,
         "test_metrics": test_metrics,
-        "calibration": (
-            calibrator["method"]
-            if calibrator
-            else (
-                "none"
-                if args.no_calibration or args.calibration_mode == "none"
-                else "raw_best"
-            )
-        ),
+        "calibration": calibrator["method"] if calibrator else "raw_best",
         "calibration_mode": args.calibration_mode,
         "blend_alpha": blend_alpha,
+        "model_type": "basketball_in_game",
     }
     meta_path = os.path.join(args.artifacts, "model_meta.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"Saved metadata to {meta_path}")
 
-    # Calibration plot (prefer calibrated curve when available)
-    plot_probs = pred_test
-    if calibrator is not None:
-        plot_probs = apply_calibration(pred_test, calibrator)
-    save_calibration_plot(
-        y_test,
-        plot_probs,
-        os.path.join(args.artifacts, "calibration.png"),
-    )
+    plot_probs = apply_calibration(pred_test, calibrator) if calibrator else pred_test
+    save_calibration_plot(y_test, plot_probs, os.path.join(args.artifacts, "calibration.png"))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """
-ML prediction server for market resolution probabilities.
+ML prediction server for basketball in-game win probability.
 
 Start with:
     uvicorn serve:app --host 127.0.0.1 --port 8766
@@ -51,59 +51,56 @@ async def lifespan(app: FastAPI):
         _blend_alpha = meta.get("blend_alpha", 1.0)
         print(f"Feature names: {_feature_names}")
         if _blend_alpha < 1.0:
-            print(f"Blend alpha: {_blend_alpha} (blends model with market price)")
+            print(f"Blend alpha: {_blend_alpha} (blends model with poly_price)")
 
     _calibrator = load_calibration(cal_path)
     if _calibrator:
         m = _calibrator.get("method", "?")
-        print(f"Loaded {m} calibrator from {cal_path} — /predict returns calibrated P(Yes)")
+        print(f"Loaded {m} calibrator — /predict returns calibrated P(home_win)")
     else:
         print("No calibration.json — /predict returns raw booster probabilities")
 
     yield
 
 
-app = FastAPI(title="Market Resolution Predictor", lifespan=lifespan)
+app = FastAPI(title="Basketball In-Game Forecaster", lifespan=lifespan)
 
 
 class PredictRequest(BaseModel):
-    current_price: float = 0.0
-    hurst_exp: float = 0.0
-    vol_ratio: float = 0.0
-    jump_result_enc: int = 0
-    trade_count: int = 0
-    total_volume: float = 0.0
-    log_volume: float = 0.0
-    kyles_lambda: float = 0.0
-    vpin: float = 0.0
-    buy_fraction: float = 0.0
-    wallet_hhi: float = 0.0
-    article_count: int = 0
-    bullish_score: float = 0.0
-    bearish_score: float = 0.0
-    sentiment_net: float = 0.0
-    resolution_reliability: float = 0.0
-    market_age_days: float = 0.0
-    price_distance_from_50: float = 0.0
+    time_remaining_sec: float = 2400.0
+    period: int = 1
+    score_diff: int = 0
+    scoring_run_60s: int = 0
+    scoring_run_120s: int = 0
+    lead_changes_so_far: int = 0
+    largest_lead: int = 0
+    momentum: float = 0.0
+    seed_diff: float = 0.0
+    poly_price: float = 0.5
+    poly_price_drift_5m: float = 0.0
+    poly_volume_1m: float = 0.0
+    poly_buy_fraction_5m: float = 0.5
+    poly_trade_count_5m: int = 0
+    has_poly: int = 0
 
 
 class PredictResponse(BaseModel):
-    prob_yes: float
-    prob_no: float
-    edge_yes: float
-    edge_no: float
+    prob_home_win: float
+    prob_away_win: float
+    edge_vs_market: float
+    model_side: str
 
 
 def _compute_derived(req: PredictRequest) -> dict[str, float]:
     """Compute interaction features to match training pipeline."""
     eps = 1e-6
-    p = max(eps, min(1.0 - eps, req.current_price))
+    p = max(eps, min(1.0 - eps, req.poly_price))
     return {
-        "price_x_log_volume": req.current_price * req.log_volume,
-        "price_x_hhi": req.current_price * req.wallet_hhi,
-        "price_x_vpin": req.current_price * req.vpin,
-        "hhi_x_buy_fraction": req.wallet_hhi * req.buy_fraction,
-        "logit_price": math.log(p / (1.0 - p)),
+        "logit_poly_price": math.log(p / (1.0 - p)),
+        "price_x_score_diff": req.poly_price * req.score_diff,
+        "time_x_score_diff": req.time_remaining_sec * req.score_diff,
+        "log_time_remaining": math.log1p(req.time_remaining_sec),
+        "abs_score_diff": abs(req.score_diff),
     }
 
 
@@ -121,25 +118,28 @@ def predict(req: PredictRequest) -> PredictResponse:
             row.append(float(getattr(req, name, 0.0)))
     features = np.array([row])
 
-    raw_yes = float(_model.predict(features)[0])
-    prob_yes = float(apply_calibration(np.array([raw_yes]), _calibrator)[0])
+    raw = float(_model.predict(features)[0])
+    prob_home = float(apply_calibration(np.array([raw]), _calibrator)[0])
 
     if _blend_alpha < 1.0:
-        prob_yes = _blend_alpha * prob_yes + (1.0 - _blend_alpha) * req.current_price
+        prob_home = _blend_alpha * prob_home + (1.0 - _blend_alpha) * req.poly_price
 
-    prob_no = 1.0 - prob_yes
-
-    edge_yes = prob_yes - req.current_price
-    edge_no = prob_no - (1.0 - req.current_price)
+    prob_away = 1.0 - prob_home
+    edge = prob_home - req.poly_price
+    side = "HOME" if prob_home >= 0.5 else "AWAY"
 
     return PredictResponse(
-        prob_yes=round(prob_yes, 4),
-        prob_no=round(prob_no, 4),
-        edge_yes=round(edge_yes, 4),
-        edge_no=round(edge_no, 4),
+        prob_home_win=round(prob_home, 4),
+        prob_away_win=round(prob_away, 4),
+        edge_vs_market=round(edge, 4),
+        model_side=side,
     )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": _model is not None}
+    return {
+        "status": "ok",
+        "model_loaded": _model is not None,
+        "model_type": "basketball_in_game",
+    }
