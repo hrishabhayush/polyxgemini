@@ -263,22 +263,19 @@ func queryToSlug(query string) string {
 	if q == "" {
 		return ""
 	}
-	if strings.Contains(q, "/event/") {
-		parts := strings.Split(q, "/event/")
-		if len(parts) < 2 {
-			return ""
+	// For any URL containing a host, extract the last non-empty path segment.
+	if strings.Contains(q, "/") {
+		parts := strings.Split(strings.TrimRight(q, "/"), "/")
+		for i := len(parts) - 1; i >= 0; i-- {
+			seg := strings.TrimSpace(parts[i])
+			// Skip protocol/host segments (contain "." or ":")
+			if seg != "" && !strings.Contains(seg, ".") && !strings.Contains(seg, ":") {
+				return strings.ToLower(seg)
+			}
 		}
-		tail := strings.Trim(parts[1], "/")
-		if tail == "" {
-			return ""
-		}
-		seg := strings.Split(tail, "/")
-		if len(seg) == 0 {
-			return ""
-		}
-		return strings.ToLower(strings.TrimSpace(seg[0]))
+		return ""
 	}
-	// Treat single-token kebab-case input as slug.
+	// Treat kebab-case input (no spaces) as a slug.
 	if strings.Contains(q, "-") && !strings.Contains(q, " ") {
 		return strings.ToLower(q)
 	}
@@ -493,6 +490,11 @@ func (c *Client) ResolveEvent(ctx context.Context, eventSlug string) ([]Resolved
 		Markets []gammaMarketResponse `json:"markets"`
 	}
 
+	// Normalize: extract slug from URLs or kebab-case queries.
+	if normalized := queryToSlug(eventSlug); normalized != "" {
+		eventSlug = normalized
+	}
+
 	url := fmt.Sprintf("%s/events?slug=%s", c.cfg.GammaBaseURL, eventSlug)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -517,19 +519,48 @@ func (c *Client) ResolveEvent(ctx context.Context, eventSlug string) ([]Resolved
 
 	var out []ResolvedMarket
 	for _, m := range events[0].Markets {
-		if !isBinaryYesNo(m.Outcomes) {
+		// Accept any market with exactly 2 CLOB token IDs — not restricted to Yes/No labels.
+		var tokenIDs []string
+		if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) != 2 {
 			continue
 		}
 		rm := toResolvedMarket(m)
 		if rm == nil {
-			continue
+			// toResolvedMarket rejects non-Yes/No outcomes; build manually for other outcome labels.
+			rm = buildResolvedMarket(m, tokenIDs)
 		}
 		out = append(out, *rm)
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("event %q has no binary YES/NO markets", eventSlug)
+		return nil, fmt.Errorf("no markets found in event %q", eventSlug)
 	}
 	return out, nil
+}
+
+// buildResolvedMarket builds a ResolvedMarket from a raw response and pre-parsed token IDs,
+// skipping the binary Yes/No outcomes check. Used for event sub-markets with other outcome labels.
+func buildResolvedMarket(m gammaMarketResponse, tokenIDs []string) *ResolvedMarket {
+	rm := &ResolvedMarket{
+		Slug:             m.Slug,
+		Question:         m.Question,
+		ConditionID:      m.ConditionID,
+		ClobTokenIDs:     [2]string{tokenIDs[0], tokenIDs[1]},
+		ResolutionSource: m.ResolutionSource,
+		Description:      m.Description,
+		Outcome:          resolveOutcomeFromGamma(m),
+		Closed:           m.Closed,
+	}
+	dateStr := m.EndDateISO
+	if dateStr == "" {
+		dateStr = m.EndDate
+	}
+	if t, err := time.Parse(time.RFC3339, dateStr); err == nil {
+		rm.EndDate = t
+	}
+	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+		rm.CreatedAt = t
+	}
+	return rm
 }
 
 // ResolveMarket looks up a market by slug via the Gamma API and returns its token IDs.

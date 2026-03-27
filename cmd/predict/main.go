@@ -357,25 +357,27 @@ func main() {
 
 	fmt.Printf("Searching for market: %q\n", *marketQuery)
 
-	// Try single market first; fall back to event (multi-market) lookup.
+	// Resolution order:
+	// 1. Try events?slug= (handles both single-market and multi-market events, any URL)
+	// 2. Try markets?slug= (direct market slug)
+	// 3. Try keyword search in active markets
 	var markets []polymarket.ResolvedMarket
-	m, err := polyClient.FindMarket(ctx, *marketQuery)
-	if err != nil {
-		// Check if it's a multi-market event slug.
-		slug := strings.TrimPrefix(*marketQuery, "https://polymarket.com/event/")
-		slug = strings.TrimPrefix(slug, "https://polymarket.com/markets/")
-		slug = strings.Trim(slug, "/")
-		if idx := strings.Index(slug, "/"); idx != -1 {
-			slug = slug[:idx]
-		}
-		eventMarkets, evErr := polyClient.ResolveEvent(ctx, slug)
-		if evErr != nil {
-			log.Fatalf("market not found: %v\nevent lookup also failed: %v", err, evErr)
-		}
+
+	eventMarkets, evErr := polyClient.ResolveEvent(ctx, *marketQuery)
+	if evErr == nil {
 		markets = eventMarkets
-		fmt.Printf("Found event with %d markets\n", len(markets))
+		if len(markets) == 1 {
+			fmt.Printf("Found: %s\n", markets[0].Question)
+		} else {
+			fmt.Printf("Found event with %d markets\n", len(markets))
+		}
 	} else {
+		m, err := polyClient.FindMarket(ctx, *marketQuery)
+		if err != nil {
+			log.Fatalf("market not found.\n  events API: %v\n  markets API: %v", evErr, err)
+		}
 		markets = []polymarket.ResolvedMarket{*m}
+		fmt.Printf("Found: %s\n", m.Question)
 	}
 
 	now := time.Now().UTC()
