@@ -6,6 +6,7 @@ Examples:
   python python/ml/predict_live_game.py --game-id 6534602
   python python/ml/predict_live_game.py --date 2026-03-20 --away UCF --home UCLA
   python python/ml/predict_live_game.py --from-json data/games/6534602.json
+  python python/ml/predict_live_game.py --game-id 6534602 --live --interval-sec 5
 """
 
 from __future__ import annotations
@@ -13,13 +14,15 @@ from __future__ import annotations
 import argparse
 import json
 import ssl
+import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
 from fetch_games import (
     _match_slug,
-    fetch_play_by_play,
     find_game_on_scoreboard,
     scrape_poly_slugs,
 )
@@ -28,23 +31,104 @@ from in_game_features import (
     replay_game,
 )
 
-NCAA_BASE = "https://ncaa-api.henrygd.me"
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
+
+NCAA_BASE = "https://ncaa-api.henrygd.me"
+
+
+def fetch_play_by_play_live(game_id: str) -> dict | None:
+    """Fresh PBP JSON (cache-busted); use for live loops so scores track ncaa.com."""
+    return _get_json(f"{NCAA_BASE}/game/{game_id}/play-by-play")
+
+
+DEFAULT_POLY_FEATS = {
+    "poly_price": 0.0,
+    "poly_price_drift_5m": 0.0,
+    "poly_volume_1m": 0.0,
+    "poly_buy_fraction_5m": 0.5,
+    "poly_trade_count_5m": 0,
+    "has_poly": 0,
+}
 
 
 def _norm(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
+def _cache_bust_url(url: str) -> str:
+    """Append a unique query param so CDNs/proxies do not serve stale JSON."""
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_={int(time.time() * 1000)}"
+
+
 def _get_json(url: str) -> dict | list | None:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "penn-ml-live/1.0"})
+        url_busted = _cache_bust_url(url)
+        req = urllib.request.Request(
+            url_busted,
+            headers={
+                "User-Agent": "penn-ml-live/1.0",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
         with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as r:
             return json.loads(r.read())
     except Exception:
         return None
+
+
+def _clob_book_price(token_id: str) -> tuple[float | None, float | None]:
+    """
+    Live CLOB top-of-book + last trade (matches UI better than Gamma outcomePrices).
+    Returns (mid_price_or_none, last_trade_or_none).
+    """
+    q = urllib.parse.urlencode({"token_id": token_id})
+    book = _get_json(f"https://clob.polymarket.com/book?{q}")
+    if not isinstance(book, dict):
+        return None, None
+
+    best_bid: float | None = None
+    for b in book.get("bids") or []:
+        try:
+            p = float(b.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if p > 0:
+            best_bid = p if best_bid is None else max(best_bid, p)
+
+    best_ask: float | None = None
+    for a in book.get("asks") or []:
+        try:
+            p = float(a.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if p > 0:
+            best_ask = p if best_ask is None else min(best_ask, p)
+
+    last_trade: float | None = None
+    try:
+        if book.get("last_trade_price") not in (None, ""):
+            last_trade = float(book["last_trade_price"])
+    except (TypeError, ValueError):
+        pass
+
+    mid: float | None = None
+    if best_bid is not None and best_ask is not None:
+        if best_bid <= best_ask:
+            mid = (best_bid + best_ask) / 2.0
+        elif last_trade is not None:
+            mid = last_trade
+    if mid is None and best_bid is not None and last_trade is not None:
+        mid = (best_bid + last_trade) / 2.0
+    if mid is None and best_ask is not None and last_trade is not None:
+        mid = (best_ask + last_trade) / 2.0
+    if mid is None and last_trade is not None:
+        mid = last_trade
+
+    return mid, last_trade
 
 
 def _pick_moneyline_market(event: dict) -> dict | None:
@@ -81,14 +165,7 @@ def _pick_home_index(outcomes: list[str], meta: dict) -> int:
 
 
 def _fetch_live_polymarket_features(meta: dict, slug: str) -> dict:
-    defaults = {
-        "poly_price": 0.0,
-        "poly_price_drift_5m": 0.0,
-        "poly_volume_1m": 0.0,
-        "poly_buy_fraction_5m": 0.5,
-        "poly_trade_count_5m": 0,
-        "has_poly": 0,
-    }
+    defaults = {**DEFAULT_POLY_FEATS}
     event_data = _get_json(f"https://gamma-api.polymarket.com/events?slug={slug}&limit=1")
     if not event_data:
         return defaults
@@ -110,12 +187,21 @@ def _fetch_live_polymarket_features(meta: dict, slug: str) -> dict:
     home_idx = max(0, min(home_idx, len(tokens) - 1))
     home_token = tokens[home_idx]
 
-    # Prefer latest displayed outcome price, fallback to token history latest.
+    # 1) CLOB order book each call (no caching) — matches UI bid/ask / mid; Gamma outcomePrices are often stale or 50/50.
     poly_price = None
-    if home_idx < len(outcome_prices):
+    book_mid, book_last = _clob_book_price(home_token)
+    if book_mid is not None:
+        poly_price = book_mid
+    elif book_last is not None:
+        poly_price = book_last
+
+    # 2) Gamma outcomePrices (fallback)
+    if poly_price is None and home_idx < len(outcome_prices):
         poly_price = float(outcome_prices[home_idx])
 
-    history = _get_json(f"https://clob.polymarket.com/prices-history?market={home_token}&interval=max&fidelity=500")
+    history = _get_json(
+        f"https://clob.polymarket.com/prices-history?market={urllib.parse.quote(str(home_token), safe='')}&interval=max&fidelity=500"
+    )
     hist = history.get("history", []) if isinstance(history, dict) else []
     if poly_price is None and hist:
         poly_price = float(hist[-1].get("p", 0.0))
@@ -189,6 +275,35 @@ def _meta_from_pbp(game_id: str, pbp: dict, date_str: str | None = None) -> dict
     }
 
 
+def _merge_scoreboard_meta(meta: dict, game: dict | None) -> dict:
+    """Attach seeds from scoreboard lookup when available."""
+    if not game:
+        return meta
+    out = {**meta}
+    if game.get("home_seed") is not None and game.get("home_seed") != "":
+        out["home_seed"] = game.get("home_seed", "")
+    if game.get("away_seed") is not None and game.get("away_seed") != "":
+        out["away_seed"] = game.get("away_seed", "")
+    return out
+
+
+def _pbp_indicates_final(pbp: dict) -> bool:
+    st = (pbp.get("status") or "").strip().lower()
+    if st in ("final", "complete", "completed"):
+        return True
+    return False
+
+
+def _fetch_pbp_with_retries(game_id: str, retries: int = 3) -> dict | None:
+    for attempt in range(retries):
+        pbp = fetch_play_by_play_live(str(game_id))
+        if pbp:
+            return pbp
+        if attempt < retries - 1:
+            time.sleep(0.4 * (attempt + 1))
+    return None
+
+
 def _post_predict(server: str, payload: dict) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -201,90 +316,12 @@ def _post_predict(server: str, payload: dict) -> dict:
         return json.loads(r.read())
 
 
-def _resolve_from_args(args) -> tuple[dict, dict, dict | None]:
-    if args.from_json:
-        with open(args.from_json) as f:
-            record = json.load(f)
-        return record.get("meta", {}), record.get("ncaa_pbp", {}), record.get("polymarket")
-
-    if args.game_id:
-        pbp = fetch_play_by_play(str(args.game_id))
-        if not pbp:
-            raise RuntimeError(f"Could not fetch play-by-play for game id {args.game_id}")
-        meta = _meta_from_pbp(str(args.game_id), pbp, date_str=args.date)
-        return meta, pbp, None
-
-    if not (args.date and args.away and args.home):
-        raise RuntimeError("Provide either --game-id, or (--date --away --home), or --from-json")
-
-    game = find_game_on_scoreboard(
-        date=args.date,
-        away_hint=args.away,
-        home_hint=args.home,
-        require_bracket=args.require_bracket,
-    )
-    if not game:
-        raise RuntimeError("No matching game found on scoreboard for provided date/teams")
-    pbp = fetch_play_by_play(str(game["gameID"]))
-    if not pbp:
-        raise RuntimeError(f"Could not fetch play-by-play for game id {game['gameID']}")
-    return game, pbp, None
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Predict one live NCAA game via ML server")
-    parser.add_argument("--game-id", help="NCAA game id")
-    parser.add_argument("--date", help="Date YYYY-MM-DD (needed for scoreboard lookup)")
-    parser.add_argument("--away", help="Away team hint (for scoreboard lookup)")
-    parser.add_argument("--home", help="Home team hint (for scoreboard lookup)")
-    parser.add_argument("--from-json", help="Use pre-fetched game JSON file")
-    parser.add_argument("--poly-slug", help="Optional Polymarket event slug override")
-    parser.add_argument("--no-poly", action="store_true", help="Skip Polymarket fetch")
-    parser.add_argument("--require-bracket", action="store_true", default=False)
-    parser.add_argument("--server", default="http://127.0.0.1:8766", help="Prediction server URL")
-    args = parser.parse_args()
-
-    meta, pbp, poly_prefetched = _resolve_from_args(args)
-
+def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict, dict]:
+    """Shared feature assembly for one-shot and live loops."""
     events = replay_game(pbp)
     if not events:
-        raise RuntimeError("No usable play-by-play events with score/clock data")
+        raise ValueError("No usable play-by-play events with score/clock data")
     snapshot = compute_snapshot_from_events(events, meta)
-
-    poly_feats = {
-        "poly_price": 0.0,
-        "poly_price_drift_5m": 0.0,
-        "poly_volume_1m": 0.0,
-        "poly_buy_fraction_5m": 0.5,
-        "poly_trade_count_5m": 0,
-        "has_poly": 0,
-    }
-    if poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
-        # Compatibility path for offline json runs; live fetch below can override.
-        try:
-            prices = poly_prefetched.get("prices", [])
-            if prices:
-                poly_feats["poly_price"] = float(prices[-1].get("p", 0) or 0)
-                poly_feats["has_poly"] = 1
-        except Exception:
-            pass
-    slug = args.poly_slug
-    if not args.no_poly:
-        if not slug:
-            slugs = scrape_poly_slugs()
-            slug = _match_slug(
-                slugs,
-                meta.get("away_seo", ""),
-                meta.get("home_seo", ""),
-                meta.get("away_short", ""),
-                meta.get("home_short", ""),
-                datetime.strptime(
-                    meta.get("startDate", datetime.now().strftime("%m/%d/%Y")), "%m/%d/%Y"
-                ).strftime("%Y-%m-%d"),
-            )
-        if slug:
-            poly_feats = _fetch_live_polymarket_features(meta, slug)
-
     payload = {
         "time_remaining_sec": float(snapshot["time_remaining_sec"]),
         "period": int(snapshot["period"]),
@@ -302,6 +339,196 @@ def main():
         "poly_trade_count_5m": int(poly_feats["poly_trade_count_5m"]),
         "has_poly": int(poly_feats["has_poly"]),
     }
+    return snapshot, payload
+
+
+def _poly_from_prefetched(poly_prefetched: dict | None) -> dict:
+    feats = {**DEFAULT_POLY_FEATS}
+    if poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
+        try:
+            prices = poly_prefetched.get("prices", [])
+            if prices:
+                feats["poly_price"] = float(prices[-1].get("p", 0) or 0)
+                feats["has_poly"] = 1
+        except Exception:
+            pass
+    return feats
+
+
+def _resolve_polymarket_slug(
+    meta: dict,
+    poly_slug_arg: str | None,
+    slugs_list: list[str] | None,
+) -> str | None:
+    if poly_slug_arg:
+        return poly_slug_arg
+    slugs = slugs_list if slugs_list is not None else scrape_poly_slugs()
+    return _match_slug(
+        slugs,
+        meta.get("away_seo", ""),
+        meta.get("home_seo", ""),
+        meta.get("away_short", ""),
+        meta.get("home_short", ""),
+        datetime.strptime(
+            meta.get("startDate", datetime.now().strftime("%m/%d/%Y")), "%m/%d/%Y"
+        ).strftime("%Y-%m-%d"),
+    )
+
+
+def _resolve_from_args(args) -> tuple[dict, dict, dict | None, dict | None]:
+    """
+    Returns (meta, pbp, poly_prefetched, scoreboard_game_or_none).
+    scoreboard_game is set when resolving via date/teams (for seeds).
+    """
+    if args.from_json:
+        with open(args.from_json) as f:
+            record = json.load(f)
+        return record.get("meta", {}), record.get("ncaa_pbp", {}), record.get("polymarket"), None
+
+    if args.game_id:
+        pbp = fetch_play_by_play_live(str(args.game_id))
+        if not pbp:
+            raise RuntimeError(f"Could not fetch play-by-play for game id {args.game_id}")
+        meta = _meta_from_pbp(str(args.game_id), pbp, date_str=args.date)
+        return meta, pbp, None, None
+
+    if not (args.date and args.away and args.home):
+        raise RuntimeError("Provide either --game-id, or (--date --away --home), or --from-json")
+
+    game = find_game_on_scoreboard(
+        date=args.date,
+        away_hint=args.away,
+        home_hint=args.home,
+        require_bracket=args.require_bracket,
+    )
+    if not game:
+        raise RuntimeError("No matching game found on scoreboard for provided date/teams")
+    pbp = fetch_play_by_play_live(str(game["gameID"]))
+    if not pbp:
+        raise RuntimeError(f"Could not fetch play-by-play for game id {game['gameID']}")
+    meta = _merge_scoreboard_meta(_meta_from_pbp(str(game["gameID"]), pbp, date_str=args.date), game)
+    return meta, pbp, None, game
+
+
+def _fingerprint(snapshot: dict, payload: dict) -> tuple:
+    return (
+        round(float(snapshot["time_remaining_sec"]), 1),
+        int(snapshot["away_score"]),
+        int(snapshot["home_score"]),
+        round(float(payload["poly_price"]), 4),
+    )
+
+
+def run_live_loop(args, *, stop_on_final: bool = True) -> None:
+    meta0, pbp0, poly_pf, game_sb = _resolve_from_args(args)
+    game_id = meta0.get("gameID")
+    if not game_id:
+        raise RuntimeError("Could not determine game id for live loop")
+
+    meta0 = _merge_scoreboard_meta(meta0, game_sb)
+
+    slugs_cache: list[str] | None = None
+    if not args.poly_slug and not args.no_poly:
+        slugs_cache = scrape_poly_slugs()
+
+    slug = None
+    if not args.no_poly:
+        slug = _resolve_polymarket_slug(meta0, args.poly_slug, slugs_cache)
+
+    print(
+        f"Live loop: game {game_id} | interval={args.interval_sec}s | "
+        f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}",
+        flush=True,
+    )
+
+    iteration = 0
+    last_fp: tuple | None = None
+
+    try:
+        while True:
+            iteration += 1
+            if args.max_iterations is not None and iteration > args.max_iterations:
+                print("Stopping: max-iterations reached.", flush=True)
+                break
+
+            pbp = _fetch_pbp_with_retries(str(game_id))
+            if not pbp:
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: PBP fetch failed; retrying...", flush=True)
+                time.sleep(args.interval_sec)
+                continue
+
+            meta = _meta_from_pbp(str(game_id), pbp, date_str=args.date)
+            meta = _merge_scoreboard_meta(meta, game_sb)
+
+            if stop_on_final and _pbp_indicates_final(pbp):
+                print("Game status is final; stopping live loop.", flush=True)
+                break
+
+            poly_feats = {**DEFAULT_POLY_FEATS}
+            if not args.no_poly:
+                if slug:
+                    poly_feats = _fetch_live_polymarket_features(meta, slug)
+                else:
+                    poly_feats = {**DEFAULT_POLY_FEATS}
+
+            try:
+                snapshot, payload = build_predict_payload(meta, pbp, poly_feats)
+            except ValueError as e:
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: {e}", flush=True)
+                time.sleep(args.interval_sec)
+                continue
+
+            fp = _fingerprint(snapshot, payload)
+            if args.skip_duplicate_lines and fp == last_fp:
+                time.sleep(args.interval_sec)
+                continue
+
+            try:
+                result = _post_predict(args.server, payload)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: /predict failed: {e}", flush=True)
+                time.sleep(args.interval_sec)
+                continue
+
+            last_fp = fp
+
+            ph = float(result.get("prob_home_win", 0.0))
+            pa = float(result.get("prob_away_win", 0.0))
+            edge = float(result.get("edge_vs_market", 0.0))
+            side = result.get("model_side", "?")
+            ts = datetime.now().isoformat(timespec="seconds")
+
+            print(
+                f"{ts} | t_rem={snapshot['time_remaining_sec']:.0f}s P{snapshot['period']} | "
+                f"score {snapshot['away_score']}-{snapshot['home_score']} (away-home) | "
+                f"poly={payload['poly_price']:.3f} has_poly={payload['has_poly']} | "
+                f"p_home={ph:.4f} p_away={pa:.4f} edge={edge:+.4f} side={side}",
+                flush=True,
+            )
+
+            time.sleep(args.interval_sec)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user (Ctrl+C).", flush=True)
+
+
+def run_one_shot(args) -> None:
+    meta, pbp, poly_prefetched, game_sb = _resolve_from_args(args)
+    meta = _merge_scoreboard_meta(meta, game_sb)
+
+    poly_feats = {**DEFAULT_POLY_FEATS}
+    if poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
+        poly_feats = _poly_from_prefetched(poly_prefetched)
+
+    slugs_cache: list[str] | None = None
+    if not args.no_poly and not (poly_prefetched and poly_prefetched.get("found")):
+        if not args.poly_slug:
+            slugs_cache = scrape_poly_slugs()
+        slug = _resolve_polymarket_slug(meta, args.poly_slug, slugs_cache)
+        if slug:
+            poly_feats = _fetch_live_polymarket_features(meta, slug)
+
+    snapshot, payload = build_predict_payload(meta, pbp, poly_feats)
 
     result = _post_predict(args.server, payload)
 
@@ -314,6 +541,64 @@ def main():
     print(json.dumps(result, indent=2))
     print("\nFeature payload sent:")
     print(json.dumps(payload, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Predict one live NCAA game via ML server")
+    parser.add_argument("--game-id", help="NCAA game id")
+    parser.add_argument("--date", help="Date YYYY-MM-DD (needed for scoreboard lookup)")
+    parser.add_argument("--away", help="Away team hint (for scoreboard lookup)")
+    parser.add_argument("--home", help="Home team hint (for scoreboard lookup)")
+    parser.add_argument("--from-json", help="Use pre-fetched game JSON file")
+    parser.add_argument("--poly-slug", help="Optional Polymarket event slug override")
+    parser.add_argument("--no-poly", action="store_true", help="Skip Polymarket fetch")
+    parser.add_argument("--require-bracket", action="store_true", default=False)
+    parser.add_argument("--server", default="http://127.0.0.1:8766", help="Prediction server URL")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Continuously refresh NCAA + Polymarket and call /predict each interval",
+    )
+    parser.add_argument(
+        "--interval-sec",
+        type=float,
+        default=1.0,
+        help="Seconds between live iterations (default: 5)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Optional maximum number of live iterations (then exit)",
+    )
+    parser.add_argument(
+        "--no-stop-on-final",
+        action="store_true",
+        help="Keep looping after game is final (default: stop when PBP status is final)",
+    )
+    parser.add_argument(
+        "--skip-duplicate-lines",
+        action="store_true",
+        help="Skip a tick when clock/scores/poly_price unchanged (reduces noisy repeats)",
+    )
+    args = parser.parse_args()
+
+    stop_on_final = not args.no_stop_on_final
+
+    if args.live:
+        if args.from_json:
+            print(
+                "Live mode requires live NCAA data: use --game-id or --date/--away/--home (not --from-json).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.interval_sec <= 0:
+            print("--interval-sec must be positive.", file=sys.stderr)
+            sys.exit(2)
+        run_live_loop(args, stop_on_final=stop_on_final)
+        return
+
+    run_one_shot(args)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,16 @@ import numpy as np
 import pandas as pd
 
 
-def clock_to_seconds(clock_str: str, period: int) -> float | None:
-    """Convert NCAA clock string (MM:SS) + period to total seconds remaining."""
+def _pbp_is_wbb_quarters(pbp: dict | None) -> bool:
+    """Women's games use four 10-minute quarters; men's uses two 20-minute halves."""
+    if not pbp:
+        return False
+    title = (pbp.get("title") or "").upper()
+    return "WBB" in title
+
+
+def clock_to_seconds(clock_str: str, period: int, pbp: dict | None = None) -> float | None:
+    """Convert NCAA clock string (MM:SS) + period to total seconds remaining in regulation."""
     if not clock_str or ":" not in clock_str:
         return None
     try:
@@ -17,17 +25,26 @@ def clock_to_seconds(clock_str: str, period: int) -> float | None:
     except (ValueError, TypeError):
         return None
     period_seconds_left = mins * 60 + secs
+
+    if pbp and _pbp_is_wbb_quarters(pbp):
+        # Four 10-minute quarters (2400 s regulation); OT uses same fallback as men's.
+        if 1 <= period <= 4:
+            return float((4 - period) * 600 + period_seconds_left)
+        return float(period_seconds_left)
+
+    # Men's (and generic): two 20-minute halves
     if period == 1:
-        return 1200 + period_seconds_left
+        return float(1200 + period_seconds_left)
     if period == 2:
-        return period_seconds_left
-    return period_seconds_left
+        return float(period_seconds_left)
+    return float(period_seconds_left)
 
 
 def replay_game(pbp: dict) -> list[dict]:
-    """Replay play-by-play into canonical state events."""
+    """Replay play-by-play into canonical state events (chronological order)."""
     periods = pbp.get("periods", [])
     events: list[dict] = []
+    seq = 0
     for per in periods:
         period_num = int(per.get("periodNumber", 1) or 1)
         for play in per.get("playbyplayStats", []):
@@ -35,7 +52,7 @@ def replay_game(pbp: dict) -> list[dict]:
             away_score = play.get("visitorScore")
             if home_score is None or away_score is None:
                 continue
-            secs = clock_to_seconds(play.get("clock", ""), period_num)
+            secs = clock_to_seconds(play.get("clock", ""), period_num, pbp=pbp)
             if secs is None:
                 continue
             events.append(
@@ -46,8 +63,10 @@ def replay_game(pbp: dict) -> list[dict]:
                     "home_score": int(home_score),
                     "away_score": int(away_score),
                     "event_text": play.get("eventDescription", ""),
+                    "_seq": seq,
                 }
             )
+            seq += 1
     return events
 
 
@@ -61,14 +80,19 @@ def _to_seed(value: object, default: float = 8.0) -> float:
 def compute_snapshot_from_events(events: list[dict], meta: dict, target_time: float | None = None) -> dict:
     """
     Compute one game-state snapshot for the requested game clock.
-    If target_time is None, uses latest available state (min time remaining).
+    If target_time is None, uses the last chronological play (avoids min-clock outliers and
+    wrong ordering for quarter-based games).
     """
     if not events:
         raise ValueError("No replay events available")
 
-    sorted_events = sorted(events, key=lambda e: -e["time_remaining_sec"])
+    # Descending game time; within the same clock, preserve play order (_seq).
+    sorted_events = sorted(
+        events,
+        key=lambda e: (-e["time_remaining_sec"], e.get("_seq", 0)),
+    )
     if target_time is None:
-        target_time = min(e["time_remaining_sec"] for e in sorted_events)
+        target_time = float(events[-1]["time_remaining_sec"])
 
     cur_home = 0
     cur_away = 0

@@ -147,6 +147,33 @@ Optional:
 python python/ml/predict_live_game.py --game-id 6534602 --server http://127.0.0.1:8766 --poly-slug cbb-ucf-ucla-2026-03-20
 ```
 
+### Continuous live loop (e.g. every 5 seconds)
+
+With `uvicorn` running (section 5), use `--live` to poll NCAA play-by-play and Polymarket on each tick, rebuild features, and POST to `/predict`. Output is one compact line per tick (timestamp, clock, score, poly, probabilities, edge).
+
+```bash
+# Default interval: 5 seconds; stops when PBP status is "final"
+python python/ml/predict_live_game.py --game-id 6534602 --live
+
+# Custom interval
+python python/ml/predict_live_game.py --game-id 6534602 --live --interval-sec 5
+
+# Safety cap (then exit)
+python python/ml/predict_live_game.py --game-id 6534602 --live --max-iterations 120
+
+# Keep running after the game ends (debugging)
+python python/ml/predict_live_game.py --game-id 6534602 --live --no-stop-on-final
+
+# Skip ticks when clock/scores/poly_price are unchanged (less terminal noise)
+python python/ml/predict_live_game.py --game-id 6534602 --live --skip-duplicate-lines
+```
+
+Notes:
+
+- `--live` requires live NCAA API access (`--game-id` or `--date`/`--away`/`--home`). It does not work with `--from-json`.
+- Polymarket slug is resolved once per run (or pass `--poly-slug`).
+- Ctrl+C stops the loop.
+
 ---
 
 ## Retraining workflow
@@ -203,9 +230,9 @@ python python/ml/train.py --tune
 ## File reference
 
 | File | Purpose |
-|---|---|b
+|---|---|
 | `fetch_games.py` | Downloads NCAA PBP + Polymarket data to `data/games/` |
-| `predict_live_game.py` | One-shot live inference: NCAA + Poly -> `/predict` |
+| `predict_live_game.py` | Live inference: NCAA + Poly -> `/predict` (one-shot or `--live` loop) |
 | `in_game_features.py` | Shared feature math for training/live parity |
 | `load_features.py` | Builds `features_basketball.parquet` from game JSONs |
 | `train.py` | Trains LightGBM model, saves artifacts |
