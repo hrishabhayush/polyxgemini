@@ -31,11 +31,18 @@ func NewClient(cfg config.PolymarketConfig) *Client {
 // Run on startup and re-scan every 15–30 min to pick up newly created markets.
 // Returns a slice of ResolvedMarket with ConditionID and ClobTokenIDs populated.
 func (c *Client) DiscoverMarkets(ctx context.Context, active bool, minVolume float64) ([]ResolvedMarket, error) {
-	return c.discoverWithLimit(ctx, active, minVolume, 100)
+	return c.discoverWithLimit(ctx, active, minVolume, 100, 0, nil)
 }
 
 // discoverWithLimit is the shared implementation for Gamma market list fetching.
-func (c *Client) discoverWithLimit(ctx context.Context, active bool, minVolume float64, limit int) ([]ResolvedMarket, error) {
+func (c *Client) discoverWithLimit(
+	ctx context.Context,
+	active bool,
+	minVolume float64,
+	limit int,
+	offset int,
+	extra map[string]string,
+) ([]ResolvedMarket, error) {
 	params := url.Values{}
 	if active {
 		params.Set("active", "true")
@@ -44,6 +51,12 @@ func (c *Client) discoverWithLimit(ctx context.Context, active bool, minVolume f
 		params.Set("volume_num_min", strconv.FormatFloat(minVolume, 'f', 2, 64))
 	}
 	params.Set("limit", strconv.Itoa(limit))
+	if offset > 0 {
+		params.Set("offset", strconv.Itoa(offset))
+	}
+	for k, v := range extra {
+		params.Set(k, v)
+	}
 
 	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -75,6 +88,54 @@ func (c *Client) discoverWithLimit(ctx context.Context, active bool, minVolume f
 		markets = append(markets, *rm)
 	}
 	return markets, nil
+}
+
+// DiscoverOpenMarkets paginates Gamma with closed=false until it finds target open markets.
+// This is useful as a fallback when the active=true feed is inconsistent.
+func (c *Client) DiscoverOpenMarkets(ctx context.Context, minVolume float64, target int) ([]ResolvedMarket, error) {
+	if target <= 0 {
+		target = 100
+	}
+	pageSize := 200
+	maxPages := 25
+	seen := make(map[string]bool, target)
+	out := make([]ResolvedMarket, 0, target)
+
+	for page := 0; page < maxPages && len(out) < target; page++ {
+		offset := page * pageSize
+		batch, err := c.discoverWithLimit(
+			ctx,
+			false, // don't rely on active=true semantics
+			minVolume,
+			pageSize,
+			offset,
+			map[string]string{
+				"closed":    "false",
+				"order":     "volume24hr",
+				"ascending": "false",
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, m := range batch {
+			if m.Closed {
+				continue
+			}
+			if seen[m.ConditionID] {
+				continue
+			}
+			seen[m.ConditionID] = true
+			out = append(out, m)
+			if len(out) >= target {
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // DiscoverResolvedMarkets fetches closed markets with known outcomes from the Gamma API.
@@ -132,12 +193,21 @@ func (c *Client) DiscoverResolvedMarkets(ctx context.Context, limit, offset int,
 // on Question or Slug. Scans up to 500 markets sorted by 24-hour volume (highest
 // first) so that current, liquid markets are found before stale/historical ones.
 // Intended for test/report use — not for high-frequency polling.
+// FindMarket searches for a single binary market by slug, event slug, URL, or
+// keyword query. Returns an error if zero or multiple markets are found — use
+// FindMarketsInEvent for queries that may match an event with multiple markets.
 func (c *Client) FindMarket(ctx context.Context, query string) (*ResolvedMarket, error) {
 	// First try direct slug resolution for deterministic lookup.
 	// Handles raw slug input and full Polymarket event URLs.
 	if slug := queryToSlug(query); slug != "" {
 		if m, err := c.ResolveMarket(ctx, slug); err == nil {
 			return m, nil
+		}
+		// Slug didn't match a market — try it as an event slug.
+		if markets, err := c.ResolveEvent(ctx, slug); err == nil && len(markets) == 1 {
+			return &markets[0], nil
+		} else if err == nil && len(markets) > 1 {
+			return nil, fmt.Errorf("event %q contains %d markets — use FindMarketsInEvent or be more specific", slug, len(markets))
 		}
 	}
 
@@ -372,11 +442,24 @@ func resolveOutcomeFromGamma(m gammaMarketResponse) string {
 	return labels[bestIdx]
 }
 
+// isBinaryYesNo returns true only for markets with exactly ["Yes","No"] outcomes.
+func isBinaryYesNo(outcomesJSON string) bool {
+	var outcomes []string
+	if err := json.Unmarshal([]byte(outcomesJSON), &outcomes); err != nil || len(outcomes) != 2 {
+		return false
+	}
+	a, b := strings.ToLower(strings.TrimSpace(outcomes[0])), strings.ToLower(strings.TrimSpace(outcomes[1]))
+	return (a == "yes" && b == "no") || (a == "no" && b == "yes")
+}
+
 // toResolvedMarket converts a gammaMarketResponse to a ResolvedMarket.
-// Returns nil if the response has malformed token IDs.
+// Returns nil if the response has malformed token IDs or is not a binary Yes/No market.
 func toResolvedMarket(m gammaMarketResponse) *ResolvedMarket {
 	var tokenIDs []string
-	if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) < 2 {
+	if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) != 2 {
+		return nil
+	}
+	if !isBinaryYesNo(m.Outcomes) {
 		return nil
 	}
 	rm := &ResolvedMarket{
@@ -400,6 +483,53 @@ func toResolvedMarket(m gammaMarketResponse) *ResolvedMarket {
 		rm.CreatedAt = t
 	}
 	return rm
+}
+
+// ResolveEvent looks up a Polymarket event by slug and returns all binary YES/NO
+// markets contained within it. Events are top-level groupings (e.g. "fed-decision-in-october")
+// that contain one or more individual markets.
+func (c *Client) ResolveEvent(ctx context.Context, eventSlug string) ([]ResolvedMarket, error) {
+	type eventResponse struct {
+		Markets []gammaMarketResponse `json:"markets"`
+	}
+
+	url := fmt.Sprintf("%s/events?slug=%s", c.cfg.GammaBaseURL, eventSlug)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gamma events request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gamma events returned status %d", resp.StatusCode)
+	}
+
+	var events []eventResponse
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, fmt.Errorf("failed to decode events response: %w", err)
+	}
+	if len(events) == 0 {
+		return nil, fmt.Errorf("no event found for slug: %s", eventSlug)
+	}
+
+	var out []ResolvedMarket
+	for _, m := range events[0].Markets {
+		if !isBinaryYesNo(m.Outcomes) {
+			continue
+		}
+		rm := toResolvedMarket(m)
+		if rm == nil {
+			continue
+		}
+		out = append(out, *rm)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("event %q has no binary YES/NO markets", eventSlug)
+	}
+	return out, nil
 }
 
 // ResolveMarket looks up a market by slug via the Gamma API and returns its token IDs.

@@ -69,6 +69,8 @@ func main() {
 	outDir := flag.String("out", "data/snapshots", "output directory for JSONL files")
 	minVolume := flag.Float64("min-volume", 1000, "minimum market volume to include")
 	maxMarkets := flag.Int("max", 200, "maximum number of active markets to snapshot")
+	maxAgeDays := flag.Int("max-age-days", 730, "maximum market age in days to keep (filters stale legacy markets)")
+	endWithinHours := flag.Int("end-within-hours", 24*45, "skip markets ending after this many hours (far-future inactive listings)")
 	delayMS := flag.Int("delay", 500, "delay between API calls in milliseconds")
 	wsTimeout := flag.Duration("ws-timeout", 5*time.Second, "WebSocket collection duration per market")
 	flag.Parse()
@@ -100,6 +102,73 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to discover active markets: %v", err)
 	}
+	usedFallback := false
+	if len(markets) > 0 {
+		allClosed := true
+		for _, m := range markets {
+			if !m.Closed {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			// Over-fetch fallback candidates; downstream filters and no-data checks can drop many.
+			target := *maxMarkets * 20
+			if target < 100 {
+				target = 100
+			}
+			log.Printf("WARN: active=true returned %d/%d closed markets; falling back to closed=false pagination (target=%d)",
+				len(markets), len(markets), target)
+			markets, err = polyClient.DiscoverOpenMarkets(ctx, *minVolume, target)
+			if err != nil {
+				log.Fatalf("fallback open-market discovery failed: %v", err)
+			}
+			usedFallback = true
+		}
+	}
+	now := time.Now().UTC()
+	maxAge := time.Duration(*maxAgeDays) * 24 * time.Hour
+	maxEndWindow := time.Duration(*endWithinHours) * time.Hour
+
+	// Gamma active=true can include stale legacy entries; enforce stricter live filters.
+	filtered := make([]polymarket.ResolvedMarket, 0, len(markets))
+	skippedClosed := 0
+	skippedMissingEnd := 0
+	skippedExpired := 0
+	skippedTooFarEnd := 0
+	skippedTooOld := 0
+	for _, m := range markets {
+		if m.Closed {
+			skippedClosed++
+			continue
+		}
+		if m.EndDate.IsZero() {
+			skippedMissingEnd++
+			// Some open markets arrive without end_date in Gamma; allow them.
+		} else {
+			if m.EndDate.Before(now) {
+				skippedExpired++
+				continue
+			}
+			if m.EndDate.After(now.Add(maxEndWindow)) {
+				skippedTooFarEnd++
+				continue
+			}
+		}
+		if !m.CreatedAt.IsZero() && m.CreatedAt.Before(now.Add(-maxAge)) {
+			// When fallback is active, Gamma "open" rows can have stale created_at.
+			// Prefer keeping and letting CLOB data availability decide.
+			if !usedFallback {
+				skippedTooOld++
+				continue
+			}
+		}
+		filtered = append(filtered, m)
+	}
+	log.Printf("live filter: kept=%d (skipped closed=%d missing_end=%d expired=%d too_far_end=%d too_old=%d)",
+		len(filtered), skippedClosed, skippedMissingEnd, skippedExpired, skippedTooFarEnd, skippedTooOld)
+
+	markets = filtered
 	if len(markets) > *maxMarkets {
 		markets = markets[:*maxMarkets]
 	}
@@ -118,6 +187,10 @@ func main() {
 
 	for i, m := range markets {
 		snap := snapshotActive(ctx, polyClient, newsClient, gdeltClient, redditClient, finbertClient, m, finbertOK, *wsTimeout)
+		if snap.CurrentPrice == 0 && snap.TradeCount == 0 {
+			// No CLOB signal available; treat as non-live/noisy and skip output row.
+			continue
+		}
 		if err := enc.Encode(snap); err != nil {
 			log.Printf("WARN: encode %s: %v", m.ConditionID, err)
 			continue

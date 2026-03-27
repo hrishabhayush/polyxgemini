@@ -72,11 +72,20 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # Log volume (handles zero gracefully)
     out["log_volume"] = np.log1p(out["total_volume"])
 
-    # Market age in days (end_date - created_at)
-    if "created_at" in out.columns and "end_date" in out.columns:
-        out["market_age_days"] = (
-            (out["end_date"] - out["created_at"]).dt.total_seconds() / 86400
-        )
+    # Market age in days: prefer end_date - created_at; fall back to snapshot_at - created_at
+    if "created_at" in out.columns:
+        if "end_date" in out.columns:
+            end_ref = out["end_date"].fillna(out.get("snapshot_at"))
+        elif "snapshot_at" in out.columns:
+            end_ref = out["snapshot_at"]
+        else:
+            end_ref = None
+        if end_ref is not None:
+            out["market_age_days"] = (
+                (end_ref - out["created_at"]).dt.total_seconds() / 86400
+            ).clip(lower=0)
+        else:
+            out["market_age_days"] = np.nan
     else:
         out["market_age_days"] = np.nan
 
@@ -86,6 +95,16 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # Encode categorical: jump_result -> ordinal
     jump_map = {"no_jumps": 0, "reversed": 1, "sustained": 2}
     out["jump_result_enc"] = out["jump_result"].map(jump_map).fillna(0).astype(int)
+
+    # Indicator: was hurst_exp actually computed (non-zero means we had enough trades)
+    out["has_hurst"] = (out["hurst_exp"].fillna(0) != 0).astype(int)
+
+    # Log trade count (better scaling than raw count for trees)
+    out["log_trade_count"] = np.log1p(out["trade_count"].fillna(0))
+
+    # Average trade size: captures institutional (large) vs retail (small) flow
+    out["avg_trade_size"] = out["total_volume"].fillna(0) / (out["trade_count"].fillna(0) + 1)
+    out["log_avg_trade_size"] = np.log1p(out["avg_trade_size"])
 
     return out
 

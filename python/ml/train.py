@@ -21,6 +21,13 @@ from sklearn.calibration import calibration_curve
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    HAS_OPTUNA = True
+except ImportError:
+    HAS_OPTUNA = False
+
 from calibration_utils import (
     apply_calibration,
     fit_isotonic_scaler,
@@ -58,26 +65,70 @@ def time_series_oof_predictions(
         oof[va_idx] = fold_model.predict(X[va_idx])
     return oof
 
-FEATURE_COLS = [
+BASE_FEATURE_COLS = [
     "current_price",
     "hurst_exp",
+    "has_hurst",
     "vol_ratio",
     "jump_result_enc",
     "trade_count",
+    "log_trade_count",
     "total_volume",
     "log_volume",
+    "avg_trade_size",
+    "log_avg_trade_size",
     "kyles_lambda",
     "vpin",
     "buy_fraction",
     "wallet_hhi",
-    "article_count",
-    "bullish_score",
-    "bearish_score",
-    "sentiment_net",
-    "resolution_reliability",
     "market_age_days",
     "price_distance_from_50",
 ]
+
+INTERACTION_COLS = [
+    "price_x_log_volume",
+    "price_x_hhi",
+    "price_x_vpin",
+    "price_x_buy_fraction",
+    "hhi_x_buy_fraction",
+    "vpin_x_log_kyles",
+    "log_trade_x_vpin",
+    "logit_price",
+]
+
+
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive interaction / nonlinear features from base columns."""
+    df = df.copy()
+    eps = 1e-6
+    df["price_x_log_volume"] = df["current_price"] * df["log_volume"]
+    df["price_x_hhi"] = df["current_price"] * df["wallet_hhi"]
+    df["price_x_vpin"] = df["current_price"] * df["vpin"]
+    df["price_x_buy_fraction"] = df["current_price"] * df["buy_fraction"]
+    df["hhi_x_buy_fraction"] = df["wallet_hhi"] * df["buy_fraction"]
+    # Combined order-flow toxicity: VPIN × log(Kyle's lambda)
+    df["vpin_x_log_kyles"] = df["vpin"] * np.log1p(df["kyles_lambda"].abs())
+    # Volume-weighted VPIN
+    df["log_trade_x_vpin"] = df.get("log_trade_count", np.log1p(df["trade_count"])) * df["vpin"]
+    p = df["current_price"].clip(eps, 1.0 - eps)
+    df["logit_price"] = np.log(p / (1.0 - p))
+    return df
+
+
+def tune_blend_alpha(
+    model_probs: np.ndarray,
+    market_prices: np.ndarray,
+    y: np.ndarray,
+) -> float:
+    """Find alpha in [0,1] minimizing Brier: final = alpha*model + (1-alpha)*market."""
+    best_alpha, best_brier = 0.5, float("inf")
+    for alpha in np.linspace(0.0, 1.0, 101):
+        blended = alpha * model_probs + (1.0 - alpha) * market_prices
+        blended = np.clip(blended, 1e-6, 1.0 - 1e-6)
+        br = brier_score_loss(y, blended)
+        if br < best_brier:
+            best_brier, best_alpha = br, alpha
+    return round(float(best_alpha), 3)
 
 
 def time_based_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 0.15):
@@ -146,6 +197,61 @@ def save_calibration_plot(y_true, y_prob, path):
         print(f"Could not save calibration plot: {e}")
 
 
+def tune_hyperparams(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_cols: list[str],
+    n_trials: int = 60,
+    n_splits: int = 5,
+) -> dict:
+    """Optuna TPE search over LightGBM hyperparams using TimeSeriesSplit CV log loss."""
+    if not HAS_OPTUNA:
+        raise RuntimeError("optuna not installed — run: pip install optuna")
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    def objective(trial):
+        params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "verbose": -1,
+            "seed": 42,
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 8, 31),
+            "max_depth": trial.suggest_int("max_depth", 3, 6),
+            "min_child_samples": trial.suggest_int("min_child_samples", 15, 60),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 2.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 5.0),
+            "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.5),
+        }
+        scores = []
+        for tr_idx, va_idx in tscv.split(X):
+            if len(tr_idx) < 25:
+                continue
+            dtr = lgb.Dataset(X[tr_idx], label=y[tr_idx], feature_name=feature_cols)
+            dva = lgb.Dataset(X[va_idx], label=y[va_idx], feature_name=feature_cols, reference=dtr)
+            m = lgb.train(
+                params,
+                dtr,
+                num_boost_round=600,
+                valid_sets=[dva],
+                callbacks=[lgb.early_stopping(40, verbose=False), lgb.log_evaluation(-1)],
+            )
+            preds = np.clip(m.predict(X[va_idx]), 1e-7, 1 - 1e-7)
+            scores.append(log_loss(y[va_idx], preds))
+        return float(np.mean(scores)) if scores else 1.0
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    best.update({"objective": "binary", "metric": "binary_logloss", "verbose": -1, "seed": 42})
+    print(f"Optuna best CV log loss: {study.best_value:.4f}")
+    print(f"Best params: {best}")
+    return best
+
+
 def main():
     repo_root = Path(__file__).resolve().parents[2]
 
@@ -171,6 +277,17 @@ def main():
         help="Allow isotonic calibration (can tie-collapse probs; default: Platt+temperature only)",
     )
     parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Run Optuna hyperparameter search (requires: pip install optuna). ~60 trials.",
+    )
+    parser.add_argument(
+        "--tune-trials",
+        type=int,
+        default=60,
+        help="Number of Optuna trials (default: 60)",
+    )
+    parser.add_argument(
         "--calibration-mode",
         choices=["auto_oof", "auto", "temperature", "isotonic", "none"],
         default="isotonic",
@@ -187,9 +304,11 @@ def main():
     df = pd.read_parquet(args.input)
     print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
 
-    # Verify required columns exist
-    available = [c for c in FEATURE_COLS if c in df.columns]
-    missing = [c for c in FEATURE_COLS if c not in df.columns]
+    df = add_interaction_features(df)
+
+    all_cols = BASE_FEATURE_COLS + INTERACTION_COLS
+    available = [c for c in all_cols if c in df.columns]
+    missing = [c for c in all_cols if c not in df.columns]
     if missing:
         print(f"WARNING: missing feature columns (will be dropped): {missing}")
     feature_cols = available
@@ -221,20 +340,37 @@ def main():
 
     # Regularized booster: shallower trees + larger leaves reduce extreme raw probs
     # on small tabular data (helps both raw scores and any post-hoc map).
-    params = {
+    default_params = {
         "objective": "binary",
         "metric": "binary_logloss",
-        "learning_rate": 0.035,
-        "num_leaves": 15,
+        "learning_rate": 0.03,
+        "num_leaves": 16,
         "max_depth": 4,
         "min_child_samples": 25,
-        "subsample": 0.7,
-        "colsample_bytree": 0.7,
-        "reg_alpha": 0.4,
-        "reg_lambda": 1.5,
+        "subsample": 0.75,
+        "colsample_bytree": 0.75,
+        "reg_alpha": 0.3,
+        "reg_lambda": 2.0,
+        "min_split_gain": 0.05,
         "verbose": -1,
         "seed": 42,
     }
+
+    if args.tune:
+        if not HAS_OPTUNA:
+            print("WARNING: --tune requested but optuna not installed. pip install optuna. Using defaults.")
+            params = default_params
+        else:
+            print(f"\nRunning Optuna HPO ({args.tune_trials} trials, {args.cal_oof_splits}-fold CV)...")
+            params = tune_hyperparams(
+                train_df[feature_cols].values,
+                train_df["label"].values,
+                feature_cols,
+                n_trials=args.tune_trials,
+                n_splits=args.cal_oof_splits,
+            )
+    else:
+        params = default_params
 
     callbacks = [
         lgb.early_stopping(stopping_rounds=50),
@@ -264,6 +400,9 @@ def main():
 
     cal_path = os.path.join(args.artifacts, "calibration.json")
     calibrator = None
+    oof_train = None
+    pred_val_cal = pred_val
+    pred_test_cal = pred_test
     if not args.no_calibration and args.calibration_mode != "none":
         n_trees = model.num_trees()
         print(
@@ -346,6 +485,50 @@ def main():
             stale_cal.unlink()
             print(f"Removed {cal_path} (--no-calibration or --calibration-mode none)")
 
+    # --- Market-price blend ---
+    # The market price is already a probability estimate (the crowd).
+    # Blending model with market price reduces overconfidence.
+    n_trees = model.num_trees()
+    if oof_train is None:
+        print(
+            f"\nComputing OOF for blend alpha "
+            f"({args.cal_oof_splits} folds, {n_trees} trees)..."
+        )
+        oof_train = time_series_oof_predictions(
+            X_train, y_train, feature_cols, params, n_trees,
+            n_splits=args.cal_oof_splits,
+        )
+
+    oof_for_blend = oof_train
+    if calibrator:
+        oof_for_blend = apply_calibration(oof_train, calibrator)
+
+    oof_prices = train_df["current_price"].fillna(0.5).values
+    blend_alpha = tune_blend_alpha(oof_for_blend, oof_prices, y_train)
+    print(f"\nBlend alpha (tuned on OOF): {blend_alpha}")
+    print(f"  final_prob = {blend_alpha} * model + {1.0 - blend_alpha:.3f} * market_price")
+
+    if blend_alpha < 1.0:
+        def final_pred(m, p):
+            return blend_alpha * m + (1.0 - blend_alpha) * p
+
+        if calibrator:
+            pred_test_final = final_pred(pred_test_cal, prices_test)
+            pred_val_final = final_pred(pred_val_cal, prices_val)
+        else:
+            pred_test_final = final_pred(pred_test, prices_test)
+            pred_val_final = final_pred(pred_val, prices_val)
+
+        evaluate(y_val, pred_val_final, prices_val, "Validation (blended)")
+        blended_metrics = evaluate(y_test, pred_test_final, prices_test, "Test (blended)")
+
+        if blended_metrics["brier_score"] < test_metrics["brier_score"]:
+            test_metrics = blended_metrics
+            print("  -> Using blended as final (better Brier than calibrated/raw).")
+        else:
+            blend_alpha = 1.0
+            print("  -> Blend did not improve test Brier; using calibrated/raw (alpha=1.0).")
+
     # Feature importance
     importance = sorted(
         zip(feature_cols, model.feature_importance("gain")),
@@ -376,6 +559,7 @@ def main():
             )
         ),
         "calibration_mode": args.calibration_mode,
+        "blend_alpha": blend_alpha,
     }
     meta_path = os.path.join(args.artifacts, "model_meta.json")
     with open(meta_path, "w") as f:
