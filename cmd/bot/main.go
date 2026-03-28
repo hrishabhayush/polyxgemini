@@ -206,10 +206,27 @@ func main() {
 			RebalanceThreshold:   cfg.Hedge.RebalanceThreshold,
 			PollIntervalMS:       cfg.Hedge.PollIntervalMS,
 		}
-		// Game timing: default 40-minute NCAA game starting now
-		gameStart := time.Now()
-		gameDuration := 40 * time.Minute
-		hedgeMonitor = engine.NewHedgeMonitor(hedgeCfg, gameStart, gameDuration)
+		gameDurMin := cfg.Hedge.GameDurationMin
+		if gameDurMin <= 0 {
+			gameDurMin = 40
+		}
+		hedgeMonitor = engine.NewHedgeMonitor(hedgeCfg, time.Duration(gameDurMin)*time.Minute)
+	}
+
+	// Wire hedge monitor to first resolved pair's books
+	if hedgeMonitor != nil && len(polyPairMappings) > 0 && len(geminiPairMappings) > 0 {
+		pm := polyPairMappings[0]
+		var gemSymbols []string
+		for _, gm := range geminiPairMappings {
+			if gm.PairID == pm.PairID {
+				gemSymbols = append(gemSymbols, gm.InstrumentSymbol)
+			}
+		}
+		hedgeMonitor.SetActivePair(engine.PairBookMapping{
+			PairName:      pm.PairID,
+			PolyTokenIDs:  []string{pm.YesTokenID, pm.NoTokenID},
+			GeminiSymbols: gemSymbols,
+		})
 	}
 
 	// Start Polymarket WS

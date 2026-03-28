@@ -32,3 +32,4 @@ hedge:
   gemini_half_spread: 0.01
   rebalance_threshold: 1.0
   poll_interval_ms: 5000
+  game_duration_min: 40

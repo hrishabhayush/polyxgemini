@@ -50,6 +50,7 @@ type HedgeConfig struct {
 	GeminiHalfSpread     float64 `yaml:"gemini_half_spread"`
 	RebalanceThreshold   float64 `yaml:"rebalance_threshold"`
 	PollIntervalMS       int     `yaml:"poll_interval_ms"`
+	GameDurationMin      int     `yaml:"game_duration_min"` // fallback game duration (default 40)
 }
 
 // MarketPair is a resolved pair from markets.yaml for hedge monitor use.

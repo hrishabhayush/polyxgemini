@@ -17,6 +17,7 @@ type HedgeConfig struct {
 	GeminiHalfSpread     float64 `yaml:"gemini_half_spread"`     // 0.01
 	RebalanceThreshold   float64 `yaml:"rebalance_threshold"`    // 1.0 contracts
 	PollIntervalMS       int     `yaml:"poll_interval_ms"`       // 5000
+	GameDurationMin      int     `yaml:"game_duration_min"`      // 40 (NCAA default)
 }
 
 // DefaultHedgeConfig returns production defaults matching the plan.

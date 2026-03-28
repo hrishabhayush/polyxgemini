@@ -2,23 +2,38 @@ package engine
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
 
-// GeminiBook holds the latest bid/ask for a Gemini contract.
+// GeminiBook holds the latest bid/ask for a contract.
 type GeminiBook struct {
 	BestBid float64
 	BestAsk float64
 }
 
+// PolySignal is the minimal JSON written by Python each tick.
+type PolySignal struct {
+	Side      string  `json:"side"`       // "HOME" | "AWAY" | "FLAT"
+	Qty       float64 `json:"qty"`        // contract count
+	Entry     float64 `json:"entry"`      // entry price
+	TNorm     float64 `json:"t_norm"`     // normalised game time [0,1]
+	NewsCount int     `json:"news_count"` // number of news events detected
+	GameID    string  `json:"game_id"`
+}
+
 // HedgeLogEntry is one line in data/hedge_log.jsonl.
 type HedgeLogEntry struct {
 	Timestamp      string  `json:"timestamp"`
+	GameID         string  `json:"game_id"`
 	TNorm          float64 `json:"t_norm"`
 	PolyPosition   string  `json:"poly_position"`
 	PolyQty        float64 `json:"poly_qty"`
@@ -41,35 +56,51 @@ type HedgeLogEntry struct {
 	NewsActive     bool    `json:"news_active"`
 }
 
+// PairBookMapping tells the monitor which WS symbols belong to a pair.
+type PairBookMapping struct {
+	PairName       string
+	PolyTokenIDs   []string // Poly YES/NO token IDs
+	GeminiSymbols  []string // Gemini instrument symbols (lowercase)
+}
+
 // HedgeMonitor watches Poly + Gemini book prices and manages the hedge layer.
 type HedgeMonitor struct {
 	engine    *HedgeEngine
 	portfolio *GeminiPaperPortfolio
-	logPath   string
+	logPath      string
+	signalPath   string
 	pollInterval time.Duration
 
-	// Game timing: t_norm = (now - gameStart) / gameDuration
-	gameStart    time.Time
-	gameDuration time.Duration
+	// Pair-aware book selection
+	activePair string            // pair name to filter books
+	pairPoly   map[string]bool   // poly token IDs for active pair
+	pairGemini map[string]bool   // gemini symbols (lowercase) for active pair
 
-	// Poly paper position (tracked from WS book updates)
-	polyPosition string  // "HOME" | "AWAY" | ""
+	// Poly position (from signal file)
+	polyPosition string
 	polyQty      float64
 	polyEntry    float64
 
-	// News detection: tracks Poly mid-price for large shifts
+	// Game timing — from signal file t_norm, with wall-clock fallback
+	tNormFromSignal float64
+	signalFresh     bool // true if signal was read this tick
+	gameStart       time.Time
+	gameDuration    time.Duration
+
+	// News detection from signal + Poly mid-price volatility
 	lastPolyMid   float64
 	newsActive    bool
-	newsThreshold float64 // fractional shift to trigger news (e.g. 0.10 = 10%)
+	newsThreshold float64 // fractional mid shift to trigger (0.10 = 10%)
 
 	mu        sync.Mutex
 	polyBooks map[string]GeminiBook // tokenID -> latest book
 	gemBooks  map[string]GeminiBook // symbol (lowercase) -> latest book
 	done      chan struct{}
+	logDirOK  bool
 }
 
 // NewHedgeMonitor creates the monitor (not yet started).
-func NewHedgeMonitor(cfg HedgeConfig, gameStart time.Time, gameDuration time.Duration) *HedgeMonitor {
+func NewHedgeMonitor(cfg HedgeConfig, gameDuration time.Duration) *HedgeMonitor {
 	pollMS := cfg.PollIntervalMS
 	if pollMS <= 0 {
 		pollMS = 5000
@@ -78,14 +109,34 @@ func NewHedgeMonitor(cfg HedgeConfig, gameStart time.Time, gameDuration time.Dur
 		engine:        NewHedgeEngine(cfg),
 		portfolio:     &GeminiPaperPortfolio{},
 		logPath:       "data/hedge_log.jsonl",
+		signalPath:    "data/poly_position.json",
 		pollInterval:  time.Duration(pollMS) * time.Millisecond,
-		gameStart:     gameStart,
+		pairPoly:      make(map[string]bool),
+		pairGemini:    make(map[string]bool),
+		gameStart:     time.Now(),
 		gameDuration:  gameDuration,
 		newsThreshold: 0.10,
 		polyBooks:     make(map[string]GeminiBook),
 		gemBooks:      make(map[string]GeminiBook),
 		done:          make(chan struct{}),
 	}
+}
+
+// SetActivePair configures which pair's books to use for hedge decisions.
+func (m *HedgeMonitor) SetActivePair(mapping PairBookMapping) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activePair = mapping.PairName
+	m.pairPoly = make(map[string]bool)
+	for _, id := range mapping.PolyTokenIDs {
+		m.pairPoly[id] = true
+	}
+	m.pairGemini = make(map[string]bool)
+	for _, sym := range mapping.GeminiSymbols {
+		m.pairGemini[strings.ToLower(sym)] = true
+	}
+	log.Printf("[hedge] active pair=%q poly_tokens=%d gemini_symbols=%d",
+		mapping.PairName, len(mapping.PolyTokenIDs), len(mapping.GeminiSymbols))
 }
 
 // UpdatePolyBook is called by Poly WS with each orderbook update.
@@ -100,15 +151,6 @@ func (m *HedgeMonitor) UpdateGeminiBook(symbol string, bestBid, bestAsk float64)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gemBooks[strings.ToLower(symbol)] = GeminiBook{BestBid: bestBid, BestAsk: bestAsk}
-}
-
-// SetPolyPosition sets the simulated Poly position (called externally or from a signal).
-func (m *HedgeMonitor) SetPolyPosition(side string, qty, entry float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.polyPosition = side
-	m.polyQty = qty
-	m.polyEntry = entry
 }
 
 // Run starts the polling loop. Call in a goroutine.
@@ -133,7 +175,12 @@ func (m *HedgeMonitor) Stop() {
 	close(m.done)
 }
 
+// tNorm returns the best available normalised game time.
+// Prefers the Python signal's t_norm; falls back to wall-clock estimate.
 func (m *HedgeMonitor) tNorm() float64 {
+	if m.signalFresh && m.tNormFromSignal > 0 {
+		return m.tNormFromSignal
+	}
 	if m.gameDuration <= 0 {
 		return 0
 	}
@@ -144,23 +191,34 @@ func (m *HedgeMonitor) tNorm() float64 {
 }
 
 func (m *HedgeMonitor) tick() {
+	// Try reading Python signal file for Poly position + t_norm
+	m.signalFresh = false
+	var lastGameID string
+	if sig, err := m.readSignal(); err == nil {
+		m.mu.Lock()
+		if sig.Side == "HOME" || sig.Side == "AWAY" {
+			m.polyPosition = sig.Side
+		} else {
+			m.polyPosition = ""
+		}
+		m.polyQty = sig.Qty
+		m.polyEntry = sig.Entry
+		m.tNormFromSignal = sig.TNorm
+		m.signalFresh = true
+		lastGameID = sig.GameID
+		if sig.NewsCount > 0 {
+			m.newsActive = true
+		}
+		m.mu.Unlock()
+	}
+
 	m.mu.Lock()
 
-	// Get best Poly book (first available)
-	var polyBid, polyAsk float64
-	for _, b := range m.polyBooks {
-		polyBid = b.BestBid
-		polyAsk = b.BestAsk
-		break
-	}
+	// Get Poly book for active pair
+	polyBid, polyAsk := m.pairBook(m.polyBooks, m.pairPoly)
 
-	// Get best Gemini book (first available)
-	var gemBid, gemAsk float64
-	for _, b := range m.gemBooks {
-		gemBid = b.BestBid
-		gemAsk = b.BestAsk
-		break
-	}
+	// Get Gemini book for active pair
+	gemBid, gemAsk := m.pairBook(m.gemBooks, m.pairGemini)
 
 	polySide := m.polyPosition
 	polyQty := m.polyQty
@@ -168,16 +226,23 @@ func (m *HedgeMonitor) tick() {
 
 	m.mu.Unlock()
 
-	// Need both books
-	if (polyBid <= 0 && polyAsk <= 0) || (gemBid <= 0 && gemAsk <= 0) {
+	// Need Gemini book at minimum
+	if gemBid <= 0 && gemAsk <= 0 {
 		return
 	}
 
 	tNorm := m.tNorm()
-	polyMid := (polyBid + polyAsk) / 2.0
 
-	// News detection: large mid-price shift
-	if m.lastPolyMid > 0 {
+	// Use Poly book mid if available, else estimate from entry
+	polyMid := 0.0
+	if polyBid > 0 || polyAsk > 0 {
+		polyMid = (polyBid + polyAsk) / 2.0
+	} else if polyEntry > 0 {
+		polyMid = polyEntry
+	}
+
+	// News detection: large Poly mid-price shift
+	if polyMid > 0 && m.lastPolyMid > 0 {
 		shift := math.Abs(polyMid-m.lastPolyMid) / m.lastPolyMid
 		if shift >= m.newsThreshold {
 			m.newsActive = true
@@ -185,11 +250,13 @@ func (m *HedgeMonitor) tick() {
 				shift*100, m.lastPolyMid, polyMid)
 		}
 	}
-	m.lastPolyMid = polyMid
+	if polyMid > 0 {
+		m.lastPolyMid = polyMid
+	}
 
 	// Compute Poly unrealised PnL
 	polyPnL := 0.0
-	if polySide != "" && polyQty > 0 && polyEntry > 0 {
+	if polySide != "" && polyQty > 0 && polyEntry > 0 && polyMid > 0 {
 		polyPnL = polyQty * (polyMid - polyEntry)
 	}
 
@@ -245,8 +312,27 @@ func (m *HedgeMonitor) tick() {
 	curve := m.engine.GeminiCurve(tNorm)
 	target := m.engine.TargetPosition(tNorm, m.newsActive)
 
+	// Prometheus metrics
+	metrics.HedgeTNorm.Set(tNorm)
+	metrics.HedgeCurveValue.Set(curve)
+	metrics.HedgeTargetQty.Set(target)
+	metrics.HedgeGeminiQty.Set(m.portfolio.Qty)
+	metrics.HedgeGeminiRealised.Set(m.portfolio.Realised)
+	metrics.HedgeGeminiUnrealised.Set(m.portfolio.Unrealised)
+	metrics.HedgeCombinedPnL.Set(combined)
+	metrics.HedgePolyPnL.Set(polyPnL)
+	if m.newsActive {
+		metrics.HedgeNewsActive.Set(1)
+	} else {
+		metrics.HedgeNewsActive.Set(0)
+	}
+	if directive.Action != "hold" {
+		metrics.HedgeActionsTotal.WithLabelValues(directive.Action).Inc()
+	}
+
 	entry := HedgeLogEntry{
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		GameID:         lastGameID,
 		TNorm:          tNorm,
 		PolyPosition:   polySide,
 		PolyQty:        polyQty,
@@ -278,7 +364,41 @@ func (m *HedgeMonitor) tick() {
 	m.appendLog(entry)
 }
 
+// pairBook returns the best bid/ask from the books map, filtered to keys in the allowed set.
+// If the allowed set is empty, returns the first available book (backwards compat).
+func (m *HedgeMonitor) pairBook(books map[string]GeminiBook, allowed map[string]bool) (bid, ask float64) {
+	if len(allowed) > 0 {
+		for key, b := range books {
+			if allowed[key] {
+				return b.BestBid, b.BestAsk
+			}
+		}
+		return 0, 0
+	}
+	// Fallback: first available
+	for _, b := range books {
+		return b.BestBid, b.BestAsk
+	}
+	return 0, 0
+}
+
+func (m *HedgeMonitor) readSignal() (*PolySignal, error) {
+	data, err := os.ReadFile(m.signalPath)
+	if err != nil {
+		return nil, err
+	}
+	var sig PolySignal
+	if err := json.Unmarshal(data, &sig); err != nil {
+		return nil, fmt.Errorf("parse poly_position.json: %w", err)
+	}
+	return &sig, nil
+}
+
 func (m *HedgeMonitor) appendLog(entry HedgeLogEntry) {
+	if !m.logDirOK {
+		os.MkdirAll(filepath.Dir(m.logPath), 0755)
+		m.logDirOK = true
+	}
 	f, err := os.OpenFile(m.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
