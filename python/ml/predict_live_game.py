@@ -7,6 +7,7 @@ Examples:
   python python/ml/predict_live_game.py --date 2026-03-20 --away UCF --home UCLA
   python python/ml/predict_live_game.py --from-json data/games/6534602.json
   python python/ml/predict_live_game.py --game-id 6534602 --live --interval-sec 5
+  python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from in_game_features import (
     compute_snapshot_from_events,
     replay_game,
 )
+from trading_engine import TradingEngine
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -435,9 +437,23 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
     if not args.no_poly:
         slug = _resolve_polymarket_slug(meta0, args.poly_slug, slugs_cache)
 
+    use_engine = getattr(args, "trade_engine", False)
+    engine: TradingEngine | None = None
+    if use_engine:
+        engine = TradingEngine(
+            interval_sec=args.interval_sec,
+            epsilon_base=getattr(args, "epsilon_base", 0.04),
+            epsilon_time_k=1.0,
+            persistence_sec=getattr(args, "persistence_sec", 45.0),
+            cooldown_min=getattr(args, "cooldown_min", 3.0),
+            ema_span=getattr(args, "ema_span", 25),
+            trade_log_path=getattr(args, "trade_log", "data/trade_log.jsonl"),
+        )
+
+    engine_label = " | trade_engine=ON" if use_engine else ""
     print(
         f"Live loop: game {game_id} | interval={args.interval_sec}s | "
-        f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}",
+        f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}{engine_label}",
         flush=True,
     )
 
@@ -498,11 +514,26 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             side = result.get("model_side", "?")
             ts = datetime.now().isoformat(timespec="seconds")
 
+            engine_suffix = ""
+            if engine is not None:
+                events = replay_game(pbp)
+                tr = engine.tick(snapshot, payload, result, events)
+                engine_suffix = (
+                    f" | {tr.state.value} ema={tr.ema_edge:+.4f} "
+                    f"nL={tr.normalised_lead:+.2f} eps={tr.epsilon_eff:.3f} "
+                    f"persist={tr.persistence_ticks}/{engine._k_ticks}"
+                )
+                if tr.dead_zone:
+                    engine_suffix += f" DZ:{tr.dead_zone}"
+                if tr.action == "execute":
+                    engine_suffix += " >>> TRADE SIGNAL <<<"
+
             print(
                 f"{ts} | t_rem={snapshot['time_remaining_sec']:.0f}s P{snapshot['period']} | "
                 f"score {snapshot['away_score']}-{snapshot['home_score']} (away-home) | "
                 f"poly={payload['poly_price']:.3f} has_poly={payload['has_poly']} | "
-                f"p_home={ph:.4f} p_away={pa:.4f} edge={edge:+.4f} side={side}",
+                f"p_home={ph:.4f} p_away={pa:.4f} edge={edge:+.4f} side={side}"
+                f"{engine_suffix}",
                 flush=True,
             )
 
@@ -563,7 +594,7 @@ def main():
         "--interval-sec",
         type=float,
         default=1.0,
-        help="Seconds between live iterations (default: 5)",
+        help="Seconds between live iterations (default: 1)",
     )
     parser.add_argument(
         "--max-iterations",
@@ -580,6 +611,41 @@ def main():
         "--skip-duplicate-lines",
         action="store_true",
         help="Skip a tick when clock/scores/poly_price unchanged (reduces noisy repeats)",
+    )
+    parser.add_argument(
+        "--trade-engine",
+        action="store_true",
+        help="Enable trading decision engine (regime gate, EMA, persistence, state machine)",
+    )
+    parser.add_argument(
+        "--epsilon-base",
+        type=float,
+        default=0.04,
+        help="Base edge threshold in probability space (default: 0.04)",
+    )
+    parser.add_argument(
+        "--persistence-sec",
+        type=float,
+        default=45.0,
+        help="Seconds of same-side persistence before ARMED (default: 45)",
+    )
+    parser.add_argument(
+        "--cooldown-min",
+        type=float,
+        default=3.0,
+        help="Minutes of cooldown after a trade signal (default: 3)",
+    )
+    parser.add_argument(
+        "--ema-span",
+        type=int,
+        default=25,
+        help="EMA span in ticks for edge smoothing (default: 25)",
+    )
+    parser.add_argument(
+        "--trade-log",
+        type=str,
+        default="data/trade_log.jsonl",
+        help="Path for JSON-lines trade log (default: data/trade_log.jsonl)",
     )
     args = parser.parse_args()
 

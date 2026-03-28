@@ -174,6 +174,43 @@ Notes:
 - Polymarket slug is resolved once per run (or pass `--poly-slug`).
 - Ctrl+C stops the loop.
 
+### Trading decision engine (`--trade-engine`)
+
+Adds a three-layer decision filter on top of the live loop: normalised lead,
+regime gate (dead zones), EMA-smoothed edge, K-tick persistence, and a
+five-state machine (`IDLE -> WATCHING -> ARMED -> EXECUTE -> COOLDOWN`).
+
+```bash
+# Enable engine with defaults (eps=0.04, persistence=45s, cooldown=3min, EMA span=25)
+python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine
+
+# Tune parameters
+python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
+  --epsilon-base 0.05 --persistence-sec 60 --cooldown-min 5 --ema-span 30
+
+# Custom trade log path
+python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
+  --trade-log data/my_trade_log.jsonl
+```
+
+When enabled, each output line appends engine state:
+
+```
+... | ARMED ema=+0.062 nL=+1.30 eps=0.045 persist=9/9
+... | COOLDOWN ema=+0.058 nL=+1.25 eps=0.045 persist=10/9 >>> TRADE SIGNAL <<<
+```
+
+Dead zones suppress all trading:
+
+| Dead zone | Trigger |
+|---|---|
+| `end_of_quarter` | Last 60 s of any quarter/half |
+| `foul_storm` | 3+ fouls in 2 min of game clock |
+| `early_blowout` | Q1 lead >= 10 or Q2 lead >= 18 |
+| `timeout_cluster` | Back-to-back timeouts within 90 s |
+
+State transitions are logged as JSON lines to `data/trade_log.jsonl` (or `--trade-log`).
+
 ---
 
 ## Retraining workflow
@@ -232,7 +269,8 @@ python python/ml/train.py --tune
 | File | Purpose |
 |---|---|
 | `fetch_games.py` | Downloads NCAA PBP + Polymarket data to `data/games/` |
-| `predict_live_game.py` | Live inference: NCAA + Poly -> `/predict` (one-shot or `--live` loop) |
+| `predict_live_game.py` | Live inference: NCAA + Poly -> `/predict` (one-shot, `--live` loop, or `--trade-engine`) |
+| `trading_engine.py` | Decision engine: normalised lead, regime gate, EMA, persistence, state machine |
 | `in_game_features.py` | Shared feature math for training/live parity |
 | `load_features.py` | Builds `features_basketball.parquet` from game JSONs |
 | `train.py` | Trains LightGBM model, saves artifacts |
