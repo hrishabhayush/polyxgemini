@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -223,6 +224,10 @@ class _EngineConfig:
     clean_play_sec: float = 120.0  # 2 minutes required after dead zone
     regulation_secs: float = 2400.0
     trade_log_path: str = "data/trade_log.jsonl"
+    # When True: emit execute when cadence allows; ignores dead zones, epsilon, persistence, cooldown.
+    force_no_guardrails: bool = False
+    # Min wall seconds between execute signals (None = no limit).
+    min_seconds_between_executes: float | None = None
 
 
 class TradingEngine:
@@ -238,6 +243,8 @@ class TradingEngine:
         ema_span: int = 25,
         trade_log_path: str = "data/trade_log.jsonl",
         regulation_secs: float = 2400.0,
+        force_no_guardrails: bool = False,
+        min_seconds_between_executes: float | None = None,
     ):
         self._cfg = _EngineConfig(
             epsilon_base=epsilon_base,
@@ -247,12 +254,16 @@ class TradingEngine:
             ema_span=ema_span,
             regulation_secs=regulation_secs,
             trade_log_path=trade_log_path,
+            force_no_guardrails=force_no_guardrails,
+            min_seconds_between_executes=min_seconds_between_executes,
         )
         self._interval = interval_sec
         self._k_ticks = max(1, math.ceil(persistence_sec / interval_sec))
 
         # State
         self._state = State.IDLE
+        self._last_execute_mono: float | None = None
+        self._now_mono: float = 0.0
         self._ema_edge: float = 0.0
         self._ema_alpha: float = 2.0 / (ema_span + 1)
         self._ema_initialised = False
@@ -279,6 +290,8 @@ class TradingEngine:
     ) -> TickResult:
         """Process one tick. Returns state, action, and optional log entry."""
 
+        self._now_mono = time.monotonic()
+
         period = int(snapshot.get("period", 1))
         t_rem = float(snapshot.get("time_remaining_sec", 2400))
         score_diff = int(snapshot.get("score_diff", 0))
@@ -290,55 +303,69 @@ class TradingEngine:
         sig = sigma_at(period, t_rem, self._cfg.regulation_secs)
         norm_lead = normalised_lead(score_diff, sig)
 
-        # 2. Regime gate
-        dz = self._check_dead_zones(events, period, t_rem, score_diff)
-
-        # 3. EMA edge
+        # 2–5. EMA, persistence, epsilon (always updated for logging / display)
         self._update_ema(edge_raw)
-
-        # 4. Persistence
         self._update_persistence(side)
-
-        # 5. Epsilon
         eps_eff = self._epsilon_effective(t_rem)
 
-        # 6. State machine transition
         prev_state = self._state
         action = "none"
         reason = ""
 
-        if dz:
-            if self._state != State.IDLE:
-                reason = f"dead_zone:{dz}"
-                self._transition(State.IDLE, reason, snapshot, payload, predict_result)
-            self._last_dead_zone = True
-            self._dead_zone_clear_elapsed = 0.0
+        if self._cfg.force_no_guardrails:
+            # Debug / paper: use current prediction, ignore DZ/edge/persistence/cooldown;
+            # optional min wall time between executes (live loop polls faster).
+            self._ema_edge = edge_raw
+            dz = ""
+            if self._execute_cadence_allows():
+                action = "execute"
+                reason = "force_no_guardrails"
+                self._record_execute_time()
+            else:
+                action = "none"
+                reason = "trade_interval_wait"
         else:
-            if self._last_dead_zone:
-                self._dead_zone_clear_elapsed += self._interval
-                if self._dead_zone_clear_elapsed < self._cfg.clean_play_sec:
-                    dz = f"clean_play_wait({self._dead_zone_clear_elapsed:.0f}/{self._cfg.clean_play_sec:.0f}s)"
-                else:
-                    self._last_dead_zone = False
-                    self._dead_zone_clear_elapsed = 0.0
+            # 2. Regime gate
+            dz = self._check_dead_zones(events, period, t_rem, score_diff)
 
-            if not dz:
-                action, reason = self._step_state_machine(eps_eff, side)
+            # 6. State machine transition
+            if dz:
+                if self._state != State.IDLE:
+                    reason = f"dead_zone:{dz}"
+                    self._transition(State.IDLE, reason, snapshot, payload, predict_result)
+                self._last_dead_zone = True
+                self._dead_zone_clear_elapsed = 0.0
+            else:
+                if self._last_dead_zone:
+                    self._dead_zone_clear_elapsed += self._interval
+                    if self._dead_zone_clear_elapsed < self._cfg.clean_play_sec:
+                        dz = f"clean_play_wait({self._dead_zone_clear_elapsed:.0f}/{self._cfg.clean_play_sec:.0f}s)"
+                    else:
+                        self._last_dead_zone = False
+                        self._dead_zone_clear_elapsed = 0.0
 
-        # Decrement cooldown
-        if self._state == State.COOLDOWN:
-            self._cooldown_remaining -= self._interval
-            if self._cooldown_remaining <= 0:
-                self._cooldown_remaining = 0
-                self._in_hysteresis = True
-                reason = "cooldown_expired"
-                self._transition(State.IDLE, reason, snapshot, payload, predict_result)
+                if not dz:
+                    action, reason = self._step_state_machine(eps_eff, side, self._now_mono)
+
+            # Decrement cooldown
+            if self._state == State.COOLDOWN:
+                self._cooldown_remaining -= self._interval
+                if self._cooldown_remaining <= 0:
+                    self._cooldown_remaining = 0
+                    self._in_hysteresis = True
+                    reason = "cooldown_expired"
+                    self._transition(State.IDLE, reason, snapshot, payload, predict_result)
 
         # Build log entry on any state change
         log_entry: dict[str, Any] | None = None
+        state_for_log = (
+            State.EXECUTE
+            if self._cfg.force_no_guardrails and action == "execute"
+            else self._state
+        )
         if self._state != prev_state or action == "execute":
             log_entry = self._build_log(
-                prev_state, self._state, reason, snapshot, payload, predict_result,
+                prev_state, state_for_log, reason, snapshot, payload, predict_result,
                 norm_lead, self._ema_edge, eps_eff, dz,
             )
             self._write_log(log_entry)
@@ -393,8 +420,22 @@ class TradingEngine:
             eps *= 1.5
         return eps
 
-    def _step_state_machine(self, eps_eff: float, side: str) -> tuple[str, str]:
+    def _execute_cadence_allows(self) -> bool:
+        c = self._cfg.min_seconds_between_executes
+        if c is None or c <= 0:
+            return True
+        if self._last_execute_mono is None:
+            return True
+        return (self._now_mono - self._last_execute_mono) >= c
+
+    def _record_execute_time(self) -> None:
+        self._last_execute_mono = self._now_mono
+
+    def _step_state_machine(
+        self, eps_eff: float, side: str, now_mono: float
+    ) -> tuple[str, str]:
         """Returns (action, reason). May call _transition internally."""
+        self._now_mono = now_mono
         action = "none"
         reason = ""
 
@@ -423,11 +464,15 @@ class TradingEngine:
                 reason = "edge_dropped"
                 self._transition(State.IDLE, reason)
             elif abs(self._ema_edge) > eps_eff:
-                reason = "all_filters_passed"
-                self._transition(State.EXECUTE, reason)
-                action = "execute"
-                self._transition(State.COOLDOWN, "post_execute")
-                self._cooldown_remaining = self._cfg.cooldown_sec
+                if self._execute_cadence_allows():
+                    reason = "all_filters_passed"
+                    self._transition(State.EXECUTE, reason)
+                    action = "execute"
+                    self._record_execute_time()
+                    self._transition(State.COOLDOWN, "post_execute")
+                    self._cooldown_remaining = self._cfg.cooldown_sec
+                else:
+                    reason = "trade_interval_wait"
 
         elif self._state == State.EXECUTE:
             # Transient — immediately moves to COOLDOWN in the ARMED branch above
@@ -469,6 +514,8 @@ class TradingEngine:
             "state_from": state_from.value,
             "state_to": state_to.value,
             "reason": reason,
+            "force_no_guardrails": self._cfg.force_no_guardrails,
+            "min_seconds_between_executes": self._cfg.min_seconds_between_executes,
             "edge_ema": round(ema_edge, 5),
             "edge_raw": round(float(predict_result.get("edge_vs_market", 0)), 5),
             "norm_lead": round(norm_lead, 3),

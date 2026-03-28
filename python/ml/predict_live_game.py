@@ -42,7 +42,13 @@ NCAA_BASE = "https://ncaa-api.henrygd.me"
 
 def fetch_play_by_play_live(game_id: str) -> dict | None:
     """Fresh PBP JSON (cache-busted); use for live loops so scores track ncaa.com."""
-    return _get_json(f"{NCAA_BASE}/game/{game_id}/play-by-play")
+    # Large payloads; avoid flaky 10s timeouts and silent failures.
+    return _get_json(
+        f"{NCAA_BASE}/game/{game_id}/play-by-play",
+        timeout=45.0,
+        log_errors=True,
+        error_label=f"NCAA PBP game_id={game_id}",
+    )
 
 
 DEFAULT_POLY_FEATS = {
@@ -65,20 +71,59 @@ def _cache_bust_url(url: str) -> str:
     return f"{url}{sep}_={int(time.time() * 1000)}"
 
 
-def _get_json(url: str) -> dict | list | None:
+def _get_json(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    log_errors: bool = False,
+    error_label: str | None = None,
+) -> dict | list | None:
+    """
+    GET JSON (cache-busted). On failure returns None.
+    NCAA PBP uses fetch_play_by_play_live(..., log_errors=True) for stderr diagnostics.
+    """
+    label = error_label or url
     try:
         url_busted = _cache_bust_url(url)
         req = urllib.request.Request(
             url_busted,
             headers={
-                "User-Agent": "penn-ml-live/1.0",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36 penn-ml-live/1.0"
+                ),
+                "Accept": "application/json,*/*;q=0.8",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
             },
         )
-        with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as r:
-            return json.loads(r.read())
-    except Exception:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+            raw = r.read()
+        text = raw.decode("utf-8", errors="replace")
+        return json.loads(text)
+    except urllib.error.HTTPError as e:
+        if log_errors:
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                body = ""
+            print(
+                f"WARN: HTTP {e.code} fetching {label}: {e.reason!r} {body}",
+                file=sys.stderr,
+            )
+        return None
+    except urllib.error.URLError as e:
+        if log_errors:
+            print(f"WARN: URL error fetching {label}: {e.reason!r}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        if log_errors:
+            print(f"WARN: invalid JSON from {label}: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        if log_errors:
+            print(f"WARN: fetch failed for {label}: {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
 
@@ -296,13 +341,13 @@ def _pbp_indicates_final(pbp: dict) -> bool:
     return False
 
 
-def _fetch_pbp_with_retries(game_id: str, retries: int = 3) -> dict | None:
+def _fetch_pbp_with_retries(game_id: str, retries: int = 5) -> dict | None:
     for attempt in range(retries):
         pbp = fetch_play_by_play_live(str(game_id))
         if pbp:
             return pbp
         if attempt < retries - 1:
-            time.sleep(0.4 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1))
     return None
 
 
@@ -388,7 +433,7 @@ def _resolve_from_args(args) -> tuple[dict, dict, dict | None, dict | None]:
         return record.get("meta", {}), record.get("ncaa_pbp", {}), record.get("polymarket"), None
 
     if args.game_id:
-        pbp = fetch_play_by_play_live(str(args.game_id))
+        pbp = _fetch_pbp_with_retries(str(args.game_id))
         if not pbp:
             raise RuntimeError(f"Could not fetch play-by-play for game id {args.game_id}")
         meta = _meta_from_pbp(str(args.game_id), pbp, date_str=args.date)
@@ -405,7 +450,7 @@ def _resolve_from_args(args) -> tuple[dict, dict, dict | None, dict | None]:
     )
     if not game:
         raise RuntimeError("No matching game found on scoreboard for provided date/teams")
-    pbp = fetch_play_by_play_live(str(game["gameID"]))
+    pbp = _fetch_pbp_with_retries(str(game["gameID"]))
     if not pbp:
         raise RuntimeError(f"Could not fetch play-by-play for game id {game['gameID']}")
     meta = _merge_scoreboard_meta(_meta_from_pbp(str(game["gameID"]), pbp, date_str=args.date), game)
@@ -448,11 +493,17 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             cooldown_min=getattr(args, "cooldown_min", 3.0),
             ema_span=getattr(args, "ema_span", 25),
             trade_log_path=getattr(args, "trade_log", "data/trade_log.jsonl"),
+            force_no_guardrails=getattr(args, "disable_trade_guardrails", False),
+            min_seconds_between_executes=getattr(args, "trade_interval_sec", None),
         )
 
     engine_label = " | trade_engine=ON" if use_engine else ""
+    if use_engine and getattr(args, "disable_trade_guardrails", False):
+        engine_label += " | GUARDRAILS=OFF(debug)"
+    if use_engine and getattr(args, "trade_interval_sec", None) is not None:
+        engine_label += f" | min_trade_interval={args.trade_interval_sec:g}s"
     print(
-        f"Live loop: game {game_id} | interval={args.interval_sec}s | "
+        f"Live loop: game {game_id} | poll={args.interval_sec}s | "
         f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}{engine_label}",
         flush=True,
     )
@@ -594,7 +645,7 @@ def main():
         "--interval-sec",
         type=float,
         default=1.0,
-        help="Seconds between live iterations (default: 1)",
+        help="Seconds between NCAA/Polymarket fetch and /predict (default: 1)",
     )
     parser.add_argument(
         "--max-iterations",
@@ -616,6 +667,17 @@ def main():
         "--trade-engine",
         action="store_true",
         help="Enable trading decision engine (regime gate, EMA, persistence, state machine)",
+    )
+    parser.add_argument(
+        "--disable-trade-guardrails",
+        action="store_true",
+        help="With --trade-engine: trade on current prediction only; ignores dead zones, edge, persistence, cooldown (debug; not default). Default min time between executes is 30s unless --trade-interval-sec is set.",
+    )
+    parser.add_argument(
+        "--trade-interval-sec",
+        type=float,
+        default=None,
+        help="Minimum seconds between execute signals (default: 30 with --disable-trade-guardrails; omit for no cap in normal engine mode)",
     )
     parser.add_argument(
         "--epsilon-base",
@@ -648,6 +710,17 @@ def main():
         help="Path for JSON-lines trade log (default: data/trade_log.jsonl)",
     )
     args = parser.parse_args()
+
+    if args.trade_interval_sec is not None and args.trade_interval_sec <= 0:
+        print("--trade-interval-sec must be positive.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.disable_trade_guardrails and args.trade_interval_sec is None:
+        args.trade_interval_sec = 30.0
+
+    if args.disable_trade_guardrails and not args.trade_engine:
+        print("--disable-trade-guardrails requires --trade-engine.", file=sys.stderr)
+        sys.exit(2)
 
     stop_on_final = not args.no_stop_on_final
 

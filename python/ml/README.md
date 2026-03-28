@@ -152,7 +152,7 @@ python python/ml/predict_live_game.py --game-id 6534602 --server http://127.0.0.
 With `uvicorn` running (section 5), use `--live` to poll NCAA play-by-play and Polymarket on each tick, rebuild features, and POST to `/predict`. Output is one compact line per tick (timestamp, clock, score, poly, probabilities, edge).
 
 ```bash
-# Default interval: 5 seconds; stops when PBP status is "final"
+# Default interval: 1 second; stops when PBP status is "final"
 python python/ml/predict_live_game.py --game-id 6534602 --live
 
 # Custom interval
@@ -191,16 +191,32 @@ python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
 # Custom trade log path
 python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
   --trade-log data/my_trade_log.jsonl
+
+# Debug: poll every 1s (default) for scores/poly/model; execute at most every 30s using current prediction (no DZ/edge/persistence/cooldown).
+python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
+  --disable-trade-guardrails
+
+# Same, but 10s between execute signals
+python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
+  --disable-trade-guardrails --trade-interval-sec 10
+
+# Normal guardrails, but cap how often EXECUTE can fire (wall clock)
+python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine \
+  --trade-interval-sec 30
 ```
 
-When enabled, each output line appends engine state:
+**`--disable-trade-guardrails`** is **off by default**. With it on, the engine still **polls** at **`--interval-sec`** (default **1s**) for NCAA/Poly and `/predict`, but **`>>> TRADE SIGNAL <<<`** uses the **latest** prediction and only appears when at least **`--trade-interval-sec`** seconds have passed since the last execute (default **30** with this flag; set **`--trade-interval-sec`** to change, or use a small value to stress-test). `ema_edge` for that signal is the current raw **`edge_vs_market`** (exact zero has no sign for paper helpers that use `sign(ema_edge)`).
+
+**`--trade-interval-sec`** without **`--disable-trade-guardrails`**: optional minimum time between **`EXECUTE`** signals while the normal state machine and dead zones still apply.
+
+With **`--trade-engine`** (normal mode), each output line appends engine state:
 
 ```
 ... | ARMED ema=+0.062 nL=+1.30 eps=0.045 persist=9/9
 ... | COOLDOWN ema=+0.058 nL=+1.25 eps=0.045 persist=10/9 >>> TRADE SIGNAL <<<
 ```
 
-Dead zones suppress all trading:
+Dead zones suppress all trading (ignored when **`--disable-trade-guardrails`** is set):
 
 | Dead zone | Trigger |
 |---|---|
