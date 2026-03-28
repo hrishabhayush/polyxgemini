@@ -3,15 +3,19 @@ package polymarket
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange"
@@ -20,10 +24,19 @@ import (
 type Client struct {
 	cfg        config.PolymarketConfig
 	httpClient *http.Client
+	privateKey *ecdsa.PrivateKey
 }
 
 func NewClient(cfg config.PolymarketConfig) *Client {
-	return &Client{cfg: cfg, httpClient: &http.Client{}}
+	c := &Client{cfg: cfg, httpClient: &http.Client{}}
+	if cfg.PrivateKey != "" {
+		pk := strings.TrimPrefix(cfg.PrivateKey, "0x")
+		key, err := ethcrypto.HexToECDSA(pk)
+		if err == nil {
+			c.privateKey = key
+		}
+	}
+	return c
 }
 
 func (c *Client) FetchMarkets(ctx context.Context) ([]exchange.Market, error) {
@@ -37,35 +50,61 @@ func (c *Client) FetchOrderBook(ctx context.Context, tokenID string) (*exchange.
 }
 
 func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (*exchange.Order, error) {
-	body := map[string]any{
-		"tokenID":   order.MarketID,
-		"price":     strconv.FormatFloat(order.Price, 'f', 4, 64),
-		"size":      strconv.FormatFloat(order.Quantity, 'f', 0, 64),
-		"side":      "BUY",
-		"type":      "FOK",
-		"feeRateBps": "0",
+	if c.privateKey == nil {
+		return nil, fmt.Errorf("polymarket: private_key not configured — cannot sign orders")
 	}
-	payload, err := json.Marshal(body)
+
+	signerAddr := ethcrypto.PubkeyToAddress(c.privateKey.PublicKey).Hex()
+	funderAddr := c.cfg.WalletAddress
+	if funderAddr == "" {
+		funderAddr = signerAddr
+	}
+
+	side := SideBuy
+	if order.Side == "sell" || order.Side == "SELL" {
+		side = SideSell
+	}
+
+	makerAmt, takerAmt := ComputeAmounts(side, order.Price, order.Quantity)
+
+	signedOrder, err := BuildSignedOrder(
+		c.privateKey,
+		funderAddr,
+		signerAddr,
+		order.MarketID,
+		side,
+		makerAmt,
+		takerAmt,
+		0,
+		c.cfg.SignatureType,
+		c.cfg.APIKey,
+		"FOK",
+		false,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: build signed order: %w", err)
+	}
+
+	payload, err := json.Marshal(signedOrder)
 	if err != nil {
 		return nil, fmt.Errorf("polymarket: marshal order: %w", err)
 	}
 
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := c.sign(timestamp, string(payload))
+	requestPath := "/order"
+	hmacSig := c.sign(timestamp, http.MethodPost, requestPath, string(payload))
 
-	url := fmt.Sprintf("%s/order", c.cfg.CLOBBaseURL)
+	url := c.cfg.CLOBBaseURL + requestPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("POLY-ADDRESS", c.cfg.APIKey)
-	req.Header.Set("POLY-SIGNATURE", sig)
-	req.Header.Set("POLY-TIMESTAMP", timestamp)
-	req.Header.Set("POLY-NONCE", timestamp)
-	if c.cfg.Passphrase != "" {
-		req.Header.Set("POLY-PASSPHRASE", c.cfg.Passphrase)
-	}
+	req.Header["POLY_ADDRESS"] = []string{signerAddr}
+	req.Header["POLY_SIGNATURE"] = []string{hmacSig}
+	req.Header["POLY_TIMESTAMP"] = []string{timestamp}
+	req.Header["POLY_API_KEY"] = []string{c.cfg.APIKey}
+	req.Header["POLY_PASSPHRASE"] = []string{c.cfg.Passphrase}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -94,11 +133,15 @@ func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (
 	}, nil
 }
 
-func (c *Client) sign(timestamp, payload string) string {
-	message := timestamp + payload
-	mac := hmac.New(sha256.New, []byte(c.cfg.APISecret))
+func (c *Client) sign(timestamp, method, requestPath, body string) string {
+	message := timestamp + method + requestPath
+	if body != "" {
+		message += body
+	}
+	secret, _ := base64.URLEncoding.DecodeString(c.cfg.APISecret)
+	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(message))
-	return hex.EncodeToString(mac.Sum(nil))
+	return base64.URLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func (c *Client) CancelOrder(ctx context.Context, orderID string) error {

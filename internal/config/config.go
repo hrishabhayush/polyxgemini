@@ -17,6 +17,9 @@ type PolymarketConfig struct {
 	GammaBaseURL  string `yaml:"gamma_base_url"`
 	WSURL         string `yaml:"ws_url"`
 	WatchlistPath string `yaml:"watchlist_path"`
+	WalletAddress string `yaml:"wallet_address"`
+	PrivateKey    string `yaml:"private_key"`
+	SignatureType int    `yaml:"signature_type"`
 	APIKey        string `yaml:"api_key"`
 	APISecret     string `yaml:"api_secret"`
 	Passphrase    string `yaml:"passphrase"`
