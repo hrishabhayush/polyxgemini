@@ -11,11 +11,13 @@ type Config struct {
 	Gemini     GeminiConfig     `yaml:"gemini"`
 	Engine     EngineConfig     `yaml:"engine"`
 	Hedge      HedgeConfig      `yaml:"hedge"`
+	Sentiment  SentimentConfig  `yaml:"sentiment"`
 }
 
 type PolymarketConfig struct {
 	CLOBBaseURL   string `yaml:"clob_base_url"`
 	GammaBaseURL  string `yaml:"gamma_base_url"`
+	DataBaseURL   string `yaml:"data_base_url"`
 	WSURL         string `yaml:"ws_url"`
 	WatchlistPath string `yaml:"watchlist_path"`
 	APIKey        string `yaml:"api_key"`
@@ -37,6 +39,21 @@ type EngineConfig struct {
 	MinSpreadBPS   int     `yaml:"min_spread_bps"`
 	MaxPositionUSD float64 `yaml:"max_position_usd"`
 	DryRun         bool    `yaml:"dry_run"`
+	MLServerURL    string  `yaml:"ml_server_url"`
+	MinEdge        float64 `yaml:"min_edge"`
+}
+
+type SentimentConfig struct {
+	NewsAPIKey          string   `yaml:"newsapi_key"`
+	NewsAPIBaseURL      string   `yaml:"newsapi_base_url"`
+	GDELTBaseURL        string   `yaml:"gdelt_base_url"`
+	RedditBaseURL       string   `yaml:"reddit_base_url"`
+	RedditUserAgent     string   `yaml:"reddit_user_agent"`
+	RedditClientID      string   `yaml:"reddit_client_id"`
+	RedditClientSecret  string   `yaml:"reddit_client_secret"`
+	RedditSubreddits    []string `yaml:"reddit_subreddits"`
+	FinBERTServerURL    string   `yaml:"finbert_server_url"`
+	PollIntervalSec     int      `yaml:"poll_interval_sec"`
 }
 
 type HedgeConfig struct {
