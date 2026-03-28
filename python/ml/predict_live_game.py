@@ -39,7 +39,7 @@ from in_game_features import (
 from trading_engine import DeadZoneConfig, TradingEngine
 from paper_portfolio import PaperPortfolio, synthetic_paper_orderbook
 from risk_engine import CurveConfig, RiskEngine
-from trading_engine import TradingEngine
+import prom_metrics as pm
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -592,6 +592,11 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
         flush=True,
     )
 
+    # Start Prometheus /metrics endpoint
+    metrics_port = getattr(args, "metrics_port", 9090)
+    pm.start_metrics_server(metrics_port)
+    print(f"Prometheus metrics on :{metrics_port}/metrics", flush=True)
+
     iteration = 0
     demo_cursor = 0  # index into demo_all_events
     last_fp: tuple | None = None
@@ -727,6 +732,26 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
                 if tr.action == "execute":
                     engine_suffix += " >>> TRADE SIGNAL <<<"
+
+            # ---- Prometheus metrics ----
+            pm.trading_time_remaining.set(float(snapshot["time_remaining_sec"]))
+            pm.trading_score_diff.set(int(snapshot["score_diff"]))
+            pm.trading_poly_price.set(float(payload["poly_price"]))
+            pm.confidence_score.labels(market=str(game_id), category="ncaa").set(ph)
+            if engine is not None:
+                pm.trading_ema_edge.set(tr.ema_edge)
+                pm.trading_state.set(pm.STATE_MAP.get(tr.state.value, -1))
+                if tr.action == "execute":
+                    pm.hedge_actions_total.labels(action="execute").inc()
+            if risk is not None and portfolio is not None:
+                pm.hedge_t_norm.set(t_norm)
+                pm.hedge_curve_value.set(rs["base_curve"])
+                pm.hedge_target_qty.set(rs["target_qty"])
+                pm.hedge_actual_qty.set(rs["actual_qty"])
+                pm.hedge_news_active.set(1.0 if rs["news_boost"] > 1.01 else 0.0)
+                pm.hedge_realised_pnl.set(portfolio.realised_pnl)
+                pm.hedge_unrealised_pnl.set(portfolio.unrealised_pnl)
+                pm.hedge_combined_pnl.set(portfolio.realised_pnl + portfolio.unrealised_pnl)
 
             print(
                 f"{ts} | t_rem={snapshot['time_remaining_sec']:.0f}s P{snapshot['period']} | "
@@ -906,6 +931,12 @@ def main():
         type=float,
         default=2.0,
         help="Beta distribution beta — ramp-down speed (default: 2.0)",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=9090,
+        help="Prometheus /metrics port (default: 9090)",
     )
     args = parser.parse_args()
 
