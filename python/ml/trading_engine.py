@@ -333,6 +333,11 @@ class TradingEngine:
         self._log_path = Path(trade_log_path)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def last_side(self) -> str:
+        """Expose the last seen model side cleanly."""
+        return self._last_side
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

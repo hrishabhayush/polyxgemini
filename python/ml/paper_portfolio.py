@@ -75,10 +75,11 @@ class PaperPortfolio:
         *,
         ema_edge: float,
         ts_iso: str,
+        qty: float | None = None,
     ) -> None:
         """Close/reverse at bid then open at ask; same-side EXECUTE adds at ask (VWAP)."""
         self._last_incremental_realised = 0.0
-        qty = self.contracts_per_trade
+        qty = qty if qty is not None else self.contracts_per_trade
         target_side = "HOME" if target_side.upper() == "HOME" else "AWAY"
 
         if self.position == target_side and self.qty > 0:
@@ -119,6 +120,28 @@ class PaperPortfolio:
         self.position = target_side
         self.qty = qty
         self.entry_price = ask_f
+
+    def reduce_position(self, reduce_qty: float, books: dict[str, Any]) -> None:
+        """Close *reduce_qty* contracts at bid for curve-driven sell-downs."""
+        if not self.position or self.qty <= 0 or reduce_qty <= 0:
+            return
+        close_qty = min(reduce_qty, self.qty)
+        bid = (
+            books.get("home_bid")
+            if self.position == "HOME"
+            else books.get("away_bid")
+        )
+        if bid is None:
+            return
+        bid_f = float(bid)
+        leg = close_qty * (bid_f - self.entry_price)
+        self.realised_pnl += leg
+        self._last_incremental_realised = leg
+        self.qty -= close_qty
+        if self.qty <= 1e-9:
+            self.qty = 0.0
+            self.position = None
+            self.entry_price = 0.0
 
     def log_fields(self, books: dict[str, Any] | None) -> dict[str, Any]:
         """Flatten for JSONL merge (USD PnL on $1 face per YES contract)."""

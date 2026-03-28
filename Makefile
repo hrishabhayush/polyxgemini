@@ -1,4 +1,4 @@
-.PHONY: build run test fmt lint test-sentiment finbert-server test-finbert-python export snapshot ml-server
+.PHONY: build run test fmt lint test-sentiment finbert-server test-finbert-python export snapshot ml-server dashboard-up dashboard-down dashboard-logs
 
 build:
 	go build -o bin/bot ./cmd/bot
@@ -34,3 +34,12 @@ ml-server:
 
 test-finbert-python:
 	cd python/finbert && python test_finbert.py
+
+dashboard-up:
+	docker compose up -d
+
+dashboard-down:
+	docker compose down
+
+dashboard-logs:
+	docker compose logs -f

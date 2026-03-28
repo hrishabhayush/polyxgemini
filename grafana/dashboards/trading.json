@@ -1,0 +1,572 @@
+{
+  "uid": "polyxgemini-trading",
+  "title": "PolyxGemini - Trading",
+  "tags": ["polyxgemini", "trading"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "links": [
+    { "title": "Operations", "url": "/d/polyxgemini-operations", "type": "link", "icon": "bolt", "tooltip": "System health & WebSocket monitoring" },
+    { "title": "Trading", "url": "/d/polyxgemini-trading", "type": "link", "icon": "graph-bar", "tooltip": "PnL, capital, arbitrage & positions" },
+    { "title": "Confidence Model", "url": "/d/polyxgemini-confidence", "type": "link", "icon": "brain", "tooltip": "ML confidence scores & news sources" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "exchange",
+        "label": "Exchange",
+        "type": "custom",
+        "current": { "text": "All", "value": "$__all" },
+        "options": [
+          { "text": "All", "value": "$__all", "selected": true },
+          { "text": "polymarket", "value": "polymarket" },
+          { "text": "gemini", "value": "gemini" }
+        ],
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "pair",
+        "label": "Market Pair",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(polyxgemini_arb_spread_bps, pair)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Portfolio Summary",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Net PnL",
+      "description": "Realized PnL minus all fees. This is your actual profit. Green = making money, red = losing.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(polyxgemini_pnl_realized_usd) - sum(polyxgemini_fees_total_usd)",
+          "legendFormat": "net"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 2,
+      "title": "Realized PnL",
+      "description": "Cumulative profit from closed positions (before fees).",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(polyxgemini_pnl_realized_usd)",
+          "legendFormat": "realized"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 3,
+      "title": "Unrealized PnL",
+      "description": "Mark-to-market value of open positions. Can swing as prices move.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 10, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(polyxgemini_pnl_unrealized_usd)",
+          "legendFormat": "unrealized"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 0.01 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 4,
+      "title": "Total Fees",
+      "description": "Cumulative fees paid across both Polymarket and Gemini.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 15, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(polyxgemini_fees_total_usd)",
+          "legendFormat": "fees"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": { "mode": "fixed", "fixedColor": "orange" }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 5,
+      "title": "Total Capital",
+      "description": "Total capital deployed across both exchanges.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "targets": [
+        {
+          "expr": "polyxgemini_capital_total_usd",
+          "legendFormat": "total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+
+    {
+      "id": 201,
+      "type": "row",
+      "title": "Capital Allocation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 6,
+      "title": "Capital on Polymarket",
+      "description": "USD currently deployed on Polymarket.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "polyxgemini_capital_deployed_usd{exchange=\"polymarket\"}",
+          "legendFormat": "polymarket"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": { "mode": "fixed", "fixedColor": "purple" }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 7,
+      "title": "Capital on Gemini",
+      "description": "USD currently deployed on Gemini prediction markets.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 7 },
+      "targets": [
+        {
+          "expr": "polyxgemini_capital_deployed_usd{exchange=\"gemini\"}",
+          "legendFormat": "gemini"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 8,
+      "title": "Capital Split",
+      "description": "Visual breakdown of capital allocation across exchanges. Used to monitor rebalancing needs.",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 7 },
+      "targets": [
+        {
+          "expr": "polyxgemini_capital_deployed_usd",
+          "legendFormat": "{{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "pieType": "donut",
+        "tooltip": { "mode": "single" },
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Gemini / Polymarket Ratio",
+      "description": "Capital ratio between exchanges. When ratio > 0.5 (or <0.5), capital should be rebalanced to the other side. Threshold lines show the rebalance triggers.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 7 },
+      "targets": [
+        {
+          "expr": "polyxgemini_capital_gemini_polymarket_ratio",
+          "legendFormat": "ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 3,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "green", "value": 0.4 },
+              { "color": "green", "value": 0.6 },
+              { "color": "yellow", "value": 1.5 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        }
+      },
+      "options": { "showThresholdLabels": true, "showThresholdMarkers": true }
+    },
+
+    {
+      "id": 202,
+      "type": "row",
+      "title": "Arbitrage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "Arb Spread (bps) per Pair",
+      "description": "Current arbitrage spread in basis points. Horizontal threshold line at min_spread_bps (50bps from config). Trades only execute above this line.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "polyxgemini_arb_spread_bps{pair=~\"$pair\"}",
+          "legendFormat": "{{pair}} ({{direction}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never", "thresholdsStyle": { "mode": "line" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] } }
+    },
+    {
+      "id": 11,
+      "title": "Opportunities: Detected vs Executed",
+      "description": "Rate of arb opportunities found vs actually traded. A large gap means your latency is too slow or spreads close before execution.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "rate(polyxgemini_arb_opportunities_detected_total{pair=~\"$pair\"}[5m])",
+          "legendFormat": "detected ({{pair}})"
+        },
+        {
+          "expr": "rate(polyxgemini_arb_opportunities_executed_total{pair=~\"$pair\"}[5m])",
+          "legendFormat": "executed ({{pair}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "detected.*" },
+            "properties": [{ "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }]
+          }
+        ]
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] } }
+    },
+
+    {
+      "id": 203,
+      "type": "row",
+      "title": "Market Data",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false
+    },
+    {
+      "id": 12,
+      "title": "Best Bid / Ask by Exchange",
+      "description": "Live best bid and ask prices across both exchanges. The gap between Poly and Gemini prices IS the arb opportunity.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        {
+          "expr": "polyxgemini_book_best_bid_cents{exchange=~\"$exchange\"}",
+          "legendFormat": "bid {{exchange}} {{market}}"
+        },
+        {
+          "expr": "polyxgemini_book_best_ask_cents{exchange=~\"$exchange\"}",
+          "legendFormat": "ask {{exchange}} {{market}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": { "fillOpacity": 5, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "bid.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "ask.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last"] } }
+    },
+    {
+      "id": 13,
+      "title": "Order Book Depth",
+      "description": "Number of price levels on each side of the book. Thin books (low depth) on Gemini mean your orders can move the market.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        {
+          "expr": "polyxgemini_book_depth_levels{exchange=~\"$exchange\"}",
+          "legendFormat": "{{exchange}} {{market}} {{side}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 20, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "last"] } }
+    },
+
+    {
+      "id": 204,
+      "type": "row",
+      "title": "Execution Quality",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+      "collapsed": false
+    },
+    {
+      "id": 14,
+      "title": "Fees by Exchange",
+      "description": "Fee accumulation over time per exchange. Helps identify which exchange is more expensive to trade on.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 34 },
+      "targets": [
+        {
+          "expr": "increase(polyxgemini_fees_total_usd{exchange=~\"$exchange\"}[5m])",
+          "legendFormat": "{{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "fillOpacity": 50, "drawStyle": "bars", "showPoints": "never" },
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] } }
+    },
+    {
+      "id": 15,
+      "title": "Fill Rate",
+      "description": "Percentage of placed orders that actually fill. Below 50% = most of your orders are expiring or getting cancelled. Below 80% = room for improvement.",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 34 },
+      "targets": [
+        {
+          "expr": "polyxgemini_order_fill_rate{exchange=~\"$exchange\"}",
+          "legendFormat": "{{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "options": { "showThresholdLabels": true, "showThresholdMarkers": true }
+    },
+    {
+      "id": 16,
+      "title": "Slippage Distribution",
+      "description": "How much worse the actual fill price is vs expected. High slippage on Gemini is expected due to thin books. Measured in basis points.",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 34 },
+      "targets": [
+        {
+          "expr": "rate(polyxgemini_order_slippage_bps_bucket{exchange=~\"$exchange\"}[10m])",
+          "legendFormat": "{{exchange}} {{le}}",
+          "format": "heatmap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none" }
+      },
+      "options": { "bucketSize": 10, "combine": false, "fillOpacity": 60 }
+    },
+
+    {
+      "id": 205,
+      "type": "row",
+      "title": "Positions & PnL History",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
+      "collapsed": false
+    },
+    {
+      "id": 17,
+      "title": "Active Positions",
+      "description": "All open positions with exchange, market pair, outcome (YES/NO), and number of contracts held.",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 43 },
+      "targets": [
+        {
+          "expr": "polyxgemini_positions_active{exchange=~\"$exchange\"}",
+          "legendFormat": "{{exchange}} | {{pair}} | {{outcome}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "renameByName": { "exchange": "Exchange", "pair": "Market Pair", "outcome": "Outcome", "Value": "Contracts" },
+            "indexByName": { "Exchange": 0, "Market Pair": 1, "Outcome": 2, "Contracts": 3 }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Exchange" },
+            "properties": [{ "id": "custom.width", "value": 150 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Contracts" },
+            "properties": [
+              { "id": "custom.displayMode", "value": "color-background-solid" },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "transparent", "value": null },
+                    { "color": "blue", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 18,
+      "title": "PnL Over Time",
+      "description": "Realized and unrealized PnL history per market pair. Shows how your positions are performing over time.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 51 },
+      "targets": [
+        {
+          "expr": "polyxgemini_pnl_realized_usd{pair=~\"$pair\"}",
+          "legendFormat": "realized: {{pair}}"
+        },
+        {
+          "expr": "polyxgemini_pnl_unrealized_usd{pair=~\"$pair\"}",
+          "legendFormat": "unrealized: {{pair}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "unrealized.*" },
+            "properties": [{ "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }]
+          }
+        ]
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "min", "max"] } }
+    }
+  ],
+  "schemaVersion": 39
+}

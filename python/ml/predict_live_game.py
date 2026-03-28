@@ -32,6 +32,9 @@ from in_game_features import (
     replay_game,
 )
 from trading_engine import DeadZoneConfig, TradingEngine
+from paper_portfolio import PaperPortfolio, synthetic_paper_orderbook
+from risk_engine import CurveConfig, RiskEngine
+from trading_engine import TradingEngine
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -509,9 +512,25 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             dead_zone_config=dz_cfg,
         )
 
+    use_risk = getattr(args, "risk_engine", False)
+    risk: RiskEngine | None = None
+    portfolio: PaperPortfolio | None = None
+    if use_risk:
+        risk_cfg = CurveConfig(
+            alpha=getattr(args, "risk_curve_alpha", 3.0),
+            beta=getattr(args, "risk_curve_beta", 2.0),
+            max_contracts=getattr(args, "risk_max_contracts", 10.0),
+            news_boost_max=getattr(args, "risk_news_boost", 2.0),
+        )
+        risk = RiskEngine(risk_cfg)
+        portfolio = PaperPortfolio(contracts_per_trade=1.0)
+    prev_ema_edge: float | None = None
+
     engine_label = " | trade_engine=ON" if use_engine else ""
     if use_engine and getattr(args, "trade_interval_sec", None) is not None:
         engine_label += f" | min_trade_interval={args.trade_interval_sec:g}s"
+    if use_risk:
+        engine_label += f" | risk_engine=ON (max={risk_cfg.max_contracts} α={risk_cfg.alpha} β={risk_cfg.beta})"
     print(
         f"Live loop: game {game_id} | poll={args.interval_sec}s | "
         f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}{engine_label}",
@@ -576,6 +595,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             ts = datetime.now().isoformat(timespec="seconds")
 
             engine_suffix = ""
+            risk_suffix = ""
             if engine is not None:
                 events = replay_game(pbp)
                 tr = engine.tick(snapshot, payload, result, events)
@@ -586,6 +606,55 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 )
                 if tr.dead_zone:
                     engine_suffix += f" DZ:{tr.dead_zone}"
+
+                # Risk engine integration
+                if risk is not None and portfolio is not None:
+                    regulation_secs = 2400.0
+                    t_rem_game = float(snapshot["time_remaining_sec"])
+                    t_norm = 1.0 - (t_rem_game / regulation_secs) if regulation_secs > 0 else 1.0
+                    t_norm = max(0.0, min(1.0, t_norm))
+                    now_mono = time.monotonic()
+
+                    # News detection: large EMA edge shift (>3x epsilon)
+                    if prev_ema_edge is not None:
+                        ema_shift = abs(tr.ema_edge - prev_ema_edge)
+                        if ema_shift > 3.0 * tr.epsilon_eff and tr.epsilon_eff > 0:
+                            mag = min(1.0, ema_shift / (6.0 * tr.epsilon_eff))
+                            risk.on_news(mag, now_mono)
+                    prev_ema_edge = tr.ema_edge
+
+                    tick_side = engine.last_side.upper() if engine.last_side else side.upper()
+                    books = synthetic_paper_orderbook(payload["poly_price"])
+
+                    if tr.action == "execute":
+                        directive = risk.evaluate(tr.action, tick_side, t_norm, now_mono)
+                        if directive.action == "buy" and directive.delta_qty > 0:
+                            portfolio.on_execute(
+                                tick_side, books,
+                                ema_edge=tr.ema_edge, ts_iso=ts,
+                                qty=directive.delta_qty,
+                            )
+                            risk.on_fill(directive.delta_qty, tick_side)
+                        elif directive.action == "reduce" and directive.delta_qty < 0:
+                            portfolio.reduce_position(abs(directive.delta_qty), books)
+                            risk.on_fill(directive.delta_qty, tick_side)
+                    else:
+                        # Curve-driven rebalance (trimming) every tick
+                        directive = risk.check_rebalance(t_norm, now_mono)
+                        if directive.action == "reduce" and directive.delta_qty < 0:
+                            portfolio.reduce_position(abs(directive.delta_qty), books)
+                            risk.on_fill(directive.delta_qty, risk._actual_side or tick_side)
+
+                    portfolio.mark_to_market(books)
+                    rs = risk.status(t_norm, now_mono)
+                    risk_suffix = (
+                        f" | RISK tgt={rs['target_qty']:.1f} act={rs['actual_qty']:.1f} "
+                        f"boost={rs['news_boost']:.2f} curve={rs['base_curve']:.3f}"
+                    )
+                    if rs["in_consolidation"]:
+                        risk_suffix += " [CONSOL]"
+                    risk_suffix += f" | {portfolio.summary_line(books)}"
+
                 if tr.action == "execute":
                     engine_suffix += " >>> TRADE SIGNAL <<<"
 
@@ -594,7 +663,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 f"score {snapshot['away_score']}-{snapshot['home_score']} (away-home) | "
                 f"poly={payload['poly_price']:.3f} has_poly={payload['has_poly']} | "
                 f"p_home={ph:.4f} p_away={pa:.4f} edge={edge:+.4f} side={side}"
-                f"{engine_suffix}",
+                f"{engine_suffix}{risk_suffix}",
                 flush=True,
             )
 
@@ -714,30 +783,35 @@ def main():
         default="data/trade_log.jsonl",
         help="Path for JSON-lines trade log (default: data/trade_log.jsonl)",
     )
-    # Dead zone configuration
-    dz = parser.add_argument_group("dead zone (regime gate) thresholds")
-    dz.add_argument("--dz-eoq-sec", type=float, default=60.0,
-                     help="End-of-quarter dead zone window in seconds (default: 60)")
-    dz.add_argument("--dz-blowout-q1", type=int, default=10,
-                     help="Q1 blowout lead threshold in points (default: 10)")
-    dz.add_argument("--dz-blowout-q2", type=int, default=18,
-                     help="Q2 blowout lead threshold in points (default: 18)")
-    dz.add_argument("--dz-foul-count", type=int, default=3,
-                     help="Foul storm: number of fouls to trigger (default: 3)")
-    dz.add_argument("--dz-foul-window-sec", type=float, default=120.0,
-                     help="Foul storm: sliding window in seconds (default: 120)")
-    dz.add_argument("--dz-foul-proximity-sec", type=float, default=90.0,
-                     help="Foul storm: proximity to current clock (default: 90)")
-    dz.add_argument("--dz-timeout-gap-sec", type=float, default=90.0,
-                     help="Timeout cluster: max gap between back-to-back TOs (default: 90)")
-    dz.add_argument("--dz-timeout-proximity-sec", type=float, default=90.0,
-                     help="Timeout cluster: proximity to current clock (default: 90)")
-    dz.add_argument("--dz-clean-play-sec", type=float, default=120.0,
-                     help="Clean play wait after dead zone clears (default: 120)")
-    dz.add_argument("--dz-clean-play-strict", action="store_true", default=True,
-                     help="Require no fouls/TOs during clean play window (default: true)")
-    dz.add_argument("--no-dz-clean-play-strict", dest="dz_clean_play_strict", action="store_false",
-                     help="Allow elapsed-time-only clean play (disable strict mode)")
+    parser.add_argument(
+        "--risk-engine",
+        action="store_true",
+        help="Enable risk engine for continuous position sizing (requires --trade-engine)",
+    )
+    parser.add_argument(
+        "--risk-max-contracts",
+        type=float,
+        default=10.0,
+        help="Peak position at curve mode (default: 10)",
+    )
+    parser.add_argument(
+        "--risk-news-boost",
+        type=float,
+        default=2.0,
+        help="Max news boost multiplier (default: 2.0)",
+    )
+    parser.add_argument(
+        "--risk-curve-alpha",
+        type=float,
+        default=3.0,
+        help="Beta distribution alpha — ramp-up speed (default: 3.0)",
+    )
+    parser.add_argument(
+        "--risk-curve-beta",
+        type=float,
+        default=2.0,
+        help="Beta distribution beta — ramp-down speed (default: 2.0)",
+    )
     args = parser.parse_args()
 
     if args.trade_interval_sec is not None and args.trade_interval_sec <= 0:
