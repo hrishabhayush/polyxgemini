@@ -15,6 +15,22 @@ config/markets.yaml
 .vscode/
 *.swp
 
+.env
+
+docs/
+
+# ML data & artifacts
+data/snapshots/*.jsonl
+data/*.parquet
+python/ml/artifacts/model.txt
+python/ml/artifacts/model_meta.json
+python/ml/artifacts/calibration.png
+
+.venv-ocr/
+__pycache__/
+*.pyc
+python/ml/artifacts/
+
 # Grafana / Prometheus persistent data (managed by Docker volumes)
 grafana-data/
 prometheus-data/
