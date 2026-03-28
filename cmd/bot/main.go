@@ -6,9 +6,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/hrishabhayush/polyxgemini/internal/arb"
+	"github.com/hrishabhayush/polyxgemini/internal/budget"
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/engine"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/gemini"
@@ -21,14 +24,12 @@ func main() {
 	configPath := flag.String("config", "config/config.yaml", "path to config file")
 	flag.Parse()
 
-	// Load config
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 	log.Printf("config loaded from %s", *configPath)
 
-	// Load watchlist
 	wl, err := config.LoadWatchlist(cfg.Polymarket.WatchlistPath)
 	if err != nil {
 		log.Fatalf("failed to load watchlist: %v", err)
@@ -38,8 +39,19 @@ func main() {
 
 	ctx := context.Background()
 
-	// --- Polymarket ---
 	polyClient := polymarket.NewClient(cfg.Polymarket)
+	geminiClient := gemini.NewClient(cfg.Gemini)
+
+	budgetLimit := cfg.Engine.MaxPositionUSD
+	if budgetLimit <= 0 {
+		budgetLimit = 10_000
+	}
+	_, arbCancel := context.WithCancel(ctx)
+	defer arbCancel()
+	b := budget.New(budgetLimit, arbCancel)
+	detector := arb.NewDetector(256, b, cfg.Engine.DryRun, polyClient, geminiClient)
+	updates := detector.Updates()
+
 	var polyResolved []polymarket.ResolvedMarket
 	for _, entry := range wl.Markets {
 		m, err := polyClient.ResolveMarket(ctx, entry.Slug)
@@ -51,19 +63,7 @@ func main() {
 		polyResolved = append(polyResolved, *m)
 	}
 
-	if len(polyResolved) > 0 {
-		polyWS := polymarket.NewWSClient(polyResolved)
-		if err := polyWS.Connect(); err != nil {
-			log.Printf("WARN: polymarket ws failed: %v", err)
-		} else {
-			defer polyWS.Close()
-			log.Printf("[poly] subscribed to %d markets", len(polyResolved))
-		}
-	}
-
-	// --- Gemini ---
-	geminiClient := gemini.NewClient(cfg.Gemini)
-	var geminiResolved []gemini.ResolvedEvent
+	var allGeminiEvents []gemini.ResolvedEvent
 	for _, entry := range wl.GeminiMarkets {
 		e, err := geminiClient.ResolveEvent(ctx, entry.Ticker)
 		if err != nil {
@@ -74,11 +74,13 @@ func main() {
 		allGeminiEvents = append(allGeminiEvents, *e)
 	}
 
-	// Resolve pairs
+	var allPolyMarkets []polymarket.ResolvedMarket
+	var polyPairMappings []polymarket.PairMapping
+	var geminiPairMappings []gemini.PairMapping
+
 	for _, pair := range wl.Pairs {
 		log.Printf("[pair] resolving %q...", pair.Name)
 
-		// Resolve polymarket side
 		polyM, err := polyClient.ResolveMarket(ctx, pair.PolymarketSlug)
 		if err != nil {
 			log.Printf("WARN: pair %q: polymarket resolve failed: %v", pair.Name, err)
@@ -86,7 +88,6 @@ func main() {
 		}
 		allPolyMarkets = append(allPolyMarkets, *polyM)
 
-		// Resolve gemini side
 		geminiE, err := geminiClient.ResolveEvent(ctx, pair.GeminiTicker)
 		if err != nil {
 			log.Printf("WARN: pair %q: gemini resolve failed: %v", pair.Name, err)
@@ -94,8 +95,6 @@ func main() {
 		}
 		allGeminiEvents = append(allGeminiEvents, *geminiE)
 
-		// Build mappings from the pair config
-		// poly YES token = ClobTokenIDs[0], NO = ClobTokenIDs[1]
 		polyPairMappings = append(polyPairMappings, polymarket.PairMapping{
 			PairID:     pair.Name,
 			YesTokenID: polyM.ClobTokenIDs[0],
@@ -103,13 +102,11 @@ func main() {
 			Category:   pair.Category,
 		})
 
-		// Build MarketIDs for the arb detector
 		mids := &arb.MarketIDs{
 			PolyYesTokenID: polyM.ClobTokenIDs[0],
 			PolyNoTokenID:  polyM.ClobTokenIDs[1],
 		}
 
-		// Map gemini contracts to outcomes based on the mapping config
 		for _, om := range pair.Mapping {
 			for _, c := range geminiE.Contracts {
 				if strings.EqualFold(c.Label, om.GeminiLabel) {
@@ -129,7 +126,6 @@ func main() {
 			}
 		}
 
-		// Map remaining gemini contracts as the opposite outcome
 		mappedSymbols := make(map[string]bool)
 		for _, gpm := range geminiPairMappings {
 			if gpm.PairID == pair.Name {
@@ -138,7 +134,6 @@ func main() {
 		}
 		for _, c := range geminiE.Contracts {
 			if !mappedSymbols[c.InstrumentSymbol] {
-				// This contract wasn't explicitly mapped — it's the opposite
 				opposite := "no"
 				for _, om := range pair.Mapping {
 					if om.PolyOutcome == "no" {
@@ -159,17 +154,14 @@ func main() {
 			}
 		}
 
-		// Register market IDs with the arb detector
 		detector.RegisterPair(pair.Name, mids)
 
 		log.Printf("[pair] %q: poly=%s, gemini=%s (%d contracts)",
 			pair.Name, polyM.Slug, geminiE.Ticker, len(geminiE.Contracts))
 	}
 
-	// Start arb detector
 	go detector.Run()
 
-	// Hedge monitor (needs both Poly + Gemini WS hooks)
 	var hedgeMonitor *engine.HedgeMonitor
 	if cfg.Hedge.Mode != "" && len(allGeminiEvents) > 0 {
 		hedgeCfg := engine.HedgeConfig{
@@ -191,7 +183,6 @@ func main() {
 		hedgeMonitor = engine.NewHedgeMonitor(hedgeCfg, time.Duration(gameDurMin)*time.Minute)
 	}
 
-	// Wire hedge monitor to first resolved pair's books
 	if hedgeMonitor != nil && len(polyPairMappings) > 0 && len(geminiPairMappings) > 0 {
 		pm := polyPairMappings[0]
 		var gemSymbols []string
@@ -207,9 +198,13 @@ func main() {
 		})
 	}
 
-	// Start Polymarket WS
-	if len(allPolyMarkets) > 0 {
-		polyWS := polymarket.NewWSClient(allPolyMarkets, updates, polyPairMappings)
+	polyWSMarkets := allPolyMarkets
+	if len(polyWSMarkets) == 0 {
+		polyWSMarkets = polyResolved
+	}
+
+	if len(polyWSMarkets) > 0 {
+		polyWS := polymarket.NewWSClient(polyWSMarkets, updates, polyPairMappings)
 		if hedgeMonitor != nil {
 			polyWS.SetBookHook(hedgeMonitor.UpdatePolyBook)
 		}
@@ -217,12 +212,10 @@ func main() {
 			log.Printf("WARN: polymarket ws failed: %v", err)
 		} else {
 			defer polyWS.Close()
-			log.Printf("[poly] subscribed to %d markets", len(allPolyMarkets))
+			log.Printf("[poly] subscribed to %d markets", len(polyWSMarkets))
 		}
-		geminiResolved = append(geminiResolved, *e)
 	}
 
-	// Start Gemini WS
 	if len(allGeminiEvents) > 0 {
 		geminiWS := gemini.NewWSClient(cfg.Gemini, allGeminiEvents, updates, geminiPairMappings)
 		if hedgeMonitor != nil {
@@ -232,21 +225,21 @@ func main() {
 			log.Printf("WARN: gemini ws failed: %v", err)
 		} else {
 			defer geminiWS.Close()
-			log.Printf("[gemi] subscribed to %d events", len(geminiResolved))
+			log.Printf("[gemi] subscribed to %d events", len(allGeminiEvents))
 		}
 	}
 
-	// Start hedge monitor after both WS are connected
 	if hedgeMonitor != nil {
 		go hedgeMonitor.Run()
 		defer hedgeMonitor.Stop()
 	}
 
-	if len(allPolyMarkets) == 0 && len(allGeminiEvents) == 0 {
+	hasPoly := len(polyResolved) > 0 || len(allPolyMarkets) > 0
+	hasGem := len(allGeminiEvents) > 0
+	if !hasPoly && !hasGem {
 		log.Fatal("no markets resolved on either exchange")
 	}
 
-	// --- ML Scanner (optional) ---
 	scanCtx, scanCancel := context.WithCancel(ctx)
 	defer scanCancel()
 
@@ -268,7 +261,6 @@ func main() {
 
 	log.Println("listening for updates... (Ctrl+C to stop)")
 
-	// Wait for interrupt
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
