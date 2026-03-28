@@ -1,13 +1,23 @@
 package gemini
 
 import (
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/hrishabhayush/polyxgemini/internal/arb"
+	"github.com/hrishabhayush/polyxgemini/internal/config"
+	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 )
 
 const defaultWSURL = "wss://ws.gemini.com"
@@ -25,17 +35,35 @@ type BookTicker struct {
 
 // WSClient connects to Gemini WebSocket for prediction market data.
 type WSClient struct {
-	wsURL   string
-	conn    *websocket.Conn
-	markets []ResolvedEvent
-	// Maps instrumentSymbol -> human label
+	wsURL        string
+	cfg          config.GeminiConfig
+	conn         *websocket.Conn
+	markets      []ResolvedEvent
 	symbolLabels map[string]string
+	// Maps lowercase instrumentSymbol -> {pairID, outcome}
+	symbolToPair map[string]symbolPairInfo
+	updates      chan<- arb.PriceUpdate
 	mu           sync.Mutex
 	done         chan struct{}
 }
 
+type symbolPairInfo struct {
+	PairID   string
+	Outcome  string // "yes" or "no"
+	Category string // "sports" or "crypto"
+}
+
+// PairMapping tells the WS client which instrument symbols belong to which arb pair.
+type PairMapping struct {
+	PairID           string
+	InstrumentSymbol string // as returned by API (uppercase)
+	Outcome          string // "yes" or "no"
+	Category         string // "sports" (default) or "crypto"
+}
+
 // NewWSClient creates a Gemini WS client for the given resolved events.
-func NewWSClient(wsURL string, markets []ResolvedEvent) *WSClient {
+func NewWSClient(cfg config.GeminiConfig, markets []ResolvedEvent, updates chan<- arb.PriceUpdate, pairMappings []PairMapping) *WSClient {
+	wsURL := cfg.WSURL
 	if wsURL == "" {
 		wsURL = defaultWSURL
 	}
@@ -49,10 +77,23 @@ func NewWSClient(wsURL string, markets []ResolvedEvent) *WSClient {
 			labels[strings.ToLower(c.InstrumentSymbol)] = fmt.Sprintf("%s %s", short, c.Label)
 		}
 	}
+
+	symbolToPair := make(map[string]symbolPairInfo)
+	for _, pm := range pairMappings {
+		symbolToPair[strings.ToLower(pm.InstrumentSymbol)] = symbolPairInfo{
+			PairID:   pm.PairID,
+			Outcome:  pm.Outcome,
+			Category: pm.Category,
+		}
+	}
+
 	return &WSClient{
 		wsURL:        wsURL,
+		cfg:          cfg,
 		markets:      markets,
 		symbolLabels: labels,
+		symbolToPair: symbolToPair,
+		updates:      updates,
 		done:         make(chan struct{}),
 	}
 }
@@ -64,25 +105,41 @@ func (w *WSClient) label(symbol string) string {
 	return symbol
 }
 
-// Connect establishes the WS connection and subscribes to bookTicker for all contracts.
+// Connect establishes the authenticated WS connection and subscribes to bookTicker for all contracts.
 func (w *WSClient) Connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(w.wsURL, nil)
+	// Build auth headers for the handshake
+	nonce := strconv.FormatInt(time.Now().Unix(), 10)
+	b64Payload := base64.StdEncoding.EncodeToString([]byte(nonce))
+	mac := hmac.New(sha512.New384, []byte(w.cfg.APISecret))
+	mac.Write([]byte(b64Payload))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	headers := http.Header{}
+	headers.Set("X-GEMINI-APIKEY", w.cfg.APIKey)
+	headers.Set("X-GEMINI-NONCE", nonce)
+	headers.Set("X-GEMINI-PAYLOAD", b64Payload)
+	headers.Set("X-GEMINI-SIGNATURE", sig)
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+	conn, _, err := dialer.Dial(w.wsURL, headers)
 	if err != nil {
 		return fmt.Errorf("gemini ws dial failed: %w", err)
 	}
 	w.conn = conn
-	log.Println("gemini ws: connected")
+	log.Println("gemini ws: connected (authenticated)")
+	metrics.WSConnected.WithLabelValues("gemini").Set(1)
 
 	// Subscribe to bookTicker for each contract
 	var streams []string
 	for _, m := range w.markets {
 		for _, c := range m.Contracts {
-			// Gemini WS requires lowercase stream names
-			streams = append(streams, strings.ToLower(c.InstrumentSymbol)+"@bookTicker")
+			streams = append(streams, c.InstrumentSymbol+"@bookTicker")
 		}
 	}
 
-	subMsg := map[string]interface{}{
+	subMsg := map[string]any{
 		"id":     "1",
 		"method": "subscribe",
 		"params": streams,
@@ -92,7 +149,6 @@ func (w *WSClient) Connect() error {
 	}
 	log.Printf("gemini ws: subscribed to %d streams", len(streams))
 
-	// Read loop
 	go w.readLoop()
 
 	return nil
@@ -100,12 +156,19 @@ func (w *WSClient) Connect() error {
 
 func (w *WSClient) readLoop() {
 	defer close(w.done)
+	defer func() {
+		metrics.WSConnected.WithLabelValues("gemini").Set(0)
+		metrics.WSDisconnectsTotal.WithLabelValues("gemini").Inc()
+	}()
 	for {
 		_, msg, err := w.conn.ReadMessage()
 		if err != nil {
 			log.Printf("gemini ws: read error: %v", err)
 			return
 		}
+
+		metrics.WSMessagesTotal.WithLabelValues("gemini", "bookTicker").Inc()
+		metrics.WSLastMessageTimestamp.WithLabelValues("gemini").Set(float64(time.Now().Unix()))
 
 		var bt BookTicker
 		if err := json.Unmarshal(msg, &bt); err != nil {
@@ -115,15 +178,34 @@ func (w *WSClient) readLoop() {
 			continue
 		}
 
+		label := w.label(strings.ToLower(bt.Symbol))
 		log.Printf("[GEMI book]  %-40s | buy @ %s¢ | ask_qty: %s",
-			w.label(bt.Symbol), centsFromDecimal(bt.BestAsk), bt.AskQty)
+			label, centsFromDecimal(bt.BestAsk), bt.AskQty)
+
+		// Emit book metrics
+		var askF, bidF, qtyF float64
+		fmt.Sscanf(bt.BestAsk, "%f", &askF)
+		fmt.Sscanf(bt.BestBid, "%f", &bidF)
+		fmt.Sscanf(bt.AskQty, "%f", &qtyF)
+		metrics.BookBestAsk.WithLabelValues("gemini", bt.Symbol).Set(askF * 100)
+		metrics.BookBestBid.WithLabelValues("gemini", bt.Symbol).Set(bidF * 100)
+
+		// Push to arb detector if this symbol is in a pair
+		if info, ok := w.symbolToPair[strings.ToLower(bt.Symbol)]; ok && w.updates != nil {
+			w.updates <- arb.PriceUpdate{
+				PairID:   info.PairID,
+				Exchange: "gemini",
+				Outcome:  info.Outcome,
+				AskPrice: askF,
+				AskQty:   qtyF,
+				Category: info.Category,
+			}
+		}
 	}
 }
 
 // centsFromDecimal converts "0.87" -> "87.0"
 func centsFromDecimal(s string) string {
-	// Gemini prices are already 0-1 decimals
-	// Parse and multiply by 100 for cents display
 	var f float64
 	fmt.Sscanf(s, "%f", &f)
 	return fmt.Sprintf("%.1f", f*100)

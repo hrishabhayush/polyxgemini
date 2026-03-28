@@ -1,5 +1,16 @@
+# Standalone markets (just watch prices, no arb detection)
 markets:
   - slug: "btc-updown-5m-1774203000"
 
 gemini_markets:
-  - ticker: "NCAAM-2603222310-IOWA-FLA-M"
+  - ticker: "NCAAM-2603230045-UCLA-UCONN-M"
+
+# Paired markets for arb detection
+# poly_outcome "yes" maps to the gemini_label on the same side
+pairs:
+  - name: "UCLA vs UConn"
+    polymarket_slug: "ncaa-ucla-uconn-2026"
+    gemini_ticker: "NCAAM-2603230045-UCLA-UCONN-M"
+    mapping:
+      - poly_outcome: "yes"
+        gemini_label: "UCLA"

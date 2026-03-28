@@ -1,0 +1,425 @@
+{
+  "uid": "polyxgemini-operations",
+  "title": "PolyxGemini - Operations",
+  "tags": ["polyxgemini", "operations"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "links": [
+    { "title": "Operations", "url": "/d/polyxgemini-operations", "type": "link", "icon": "bolt", "tooltip": "System health & WebSocket monitoring" },
+    { "title": "Trading", "url": "/d/polyxgemini-trading", "type": "link", "icon": "graph-bar", "tooltip": "PnL, capital, arbitrage & positions" },
+    { "title": "Confidence Model", "url": "/d/polyxgemini-confidence", "type": "link", "icon": "brain", "tooltip": "ML confidence scores & news sources" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "exchange",
+        "label": "Exchange",
+        "type": "custom",
+        "current": { "text": "All", "value": "$__all" },
+        "options": [
+          { "text": "All", "value": "$__all", "selected": true },
+          { "text": "polymarket", "value": "polymarket" },
+          { "text": "gemini", "value": "gemini" }
+        ],
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "System Status",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Polymarket WS",
+      "description": "WebSocket connection status for Polymarket CLOB. RED = disconnected, data is stale.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "polyxgemini_ws_connected{exchange=\"polymarket\"}",
+          "legendFormat": "polymarket"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "none", "textMode": "value", "colorMode": "background", "justifyMode": "center" }
+    },
+    {
+      "id": 2,
+      "title": "Gemini WS",
+      "description": "WebSocket connection status for Gemini prediction markets. RED = disconnected, no book updates.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "targets": [
+        {
+          "expr": "polyxgemini_ws_connected{exchange=\"gemini\"}",
+          "legendFormat": "gemini"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "none", "textMode": "value", "colorMode": "background", "justifyMode": "center" }
+    },
+    {
+      "id": 3,
+      "title": "Bot Uptime",
+      "description": "Time since the bot process started. Restarts reset this to zero.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "targets": [
+        {
+          "expr": "time() - process_start_time_seconds{job=\"polyxgemini-bot\"}",
+          "legendFormat": "uptime"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dtdurations",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "green", "value": 300 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value", "colorMode": "value" }
+    },
+    {
+      "id": 4,
+      "title": "Active Tickers",
+      "description": "Number of unique market pairs the bot is actively placing orders on.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "expr": "polyxgemini_positions_active_tickers",
+          "legendFormat": "tickers"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value", "colorMode": "value" }
+    },
+    {
+      "id": 5,
+      "title": "Goroutines",
+      "description": "Number of active Go goroutines. A sudden spike may indicate a leak or runaway loop.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+      "targets": [
+        {
+          "expr": "go_goroutines{job=\"polyxgemini-bot\"}",
+          "legendFormat": "goroutines"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value", "colorMode": "value" }
+    },
+    {
+      "id": 6,
+      "title": "Heap Memory",
+      "description": "Current Go heap allocation. Watch for sustained growth indicating a memory leak.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "targets": [
+        {
+          "expr": "go_memstats_alloc_bytes{job=\"polyxgemini-bot\"}",
+          "legendFormat": "heap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 104857600 },
+              { "color": "red", "value": 524288000 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value", "colorMode": "value" }
+    },
+
+    {
+      "id": 101,
+      "type": "row",
+      "title": "WebSocket Health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "title": "WS Messages / sec",
+      "description": "Rate of WebSocket messages received per exchange. A drop to zero while connected means the feed is stale.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "rate(polyxgemini_ws_messages_total{exchange=~\"$exchange\"}[1m])",
+          "legendFormat": "{{exchange}} ({{type}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "msg/s",
+          "custom": { "fillOpacity": 20, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 8,
+      "title": "Price Staleness",
+      "description": "Seconds since the last message from each exchange. Green <5s, yellow <30s, red >30s. If red, the bot is trading on stale data.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 7 },
+      "targets": [
+        {
+          "expr": "time() - polyxgemini_ws_last_message_timestamp{exchange=~\"$exchange\"}",
+          "legendFormat": "{{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 30 }
+            ]
+          },
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "gradientMode": "scheme", "thresholdsStyle": { "mode": "area" }, "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] } }
+    },
+    {
+      "id": 9,
+      "title": "Disconnections & Reconnects",
+      "description": "WebSocket disconnection and reconnection events. Frequent disconnects indicate network instability.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 7 },
+      "targets": [
+        {
+          "expr": "increase(polyxgemini_ws_disconnects_total{exchange=~\"$exchange\"}[5m])",
+          "legendFormat": "disconnects: {{exchange}}"
+        },
+        {
+          "expr": "increase(polyxgemini_ws_reconnects_total{exchange=~\"$exchange\"}[5m])",
+          "legendFormat": "reconnects: {{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 40, "lineWidth": 1, "drawStyle": "bars", "stacking": { "mode": "none" }, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "disconnects.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "reconnects.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } }]
+          }
+        ]
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    {
+      "id": 102,
+      "type": "row",
+      "title": "Latency",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "Order Round-Trip Latency",
+      "description": "Time from PlaceOrder call to exchange confirmation. p50/p95/p99 percentiles. Target: <500ms for competitive arb.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(polyxgemini_order_roundtrip_seconds_bucket{exchange=~\"$exchange\"}[5m]))",
+          "legendFormat": "p50 {{exchange}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(polyxgemini_order_roundtrip_seconds_bucket{exchange=~\"$exchange\"}[5m]))",
+          "legendFormat": "p95 {{exchange}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(polyxgemini_order_roundtrip_seconds_bucket{exchange=~\"$exchange\"}[5m]))",
+          "legendFormat": "p99 {{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 11,
+      "title": "Arb Round-Trip (Place + Cancel)",
+      "description": "Full arbitrage cycle: detect spread, place orders on both exchanges, confirm or cancel if price moved. This is your edge timeout.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(polyxgemini_arb_roundtrip_seconds_bucket[5m]))",
+          "legendFormat": "p50 {{pair}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(polyxgemini_arb_roundtrip_seconds_bucket[5m]))",
+          "legendFormat": "p95 {{pair}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 12,
+      "title": "Cancel Latency",
+      "description": "Time to cancel an order when the arb spread disappears before fill. Must be fast to avoid being stuck in a position.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(polyxgemini_order_cancel_roundtrip_seconds_bucket{exchange=~\"$exchange\"}[5m]))",
+          "legendFormat": "p50 {{exchange}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(polyxgemini_order_cancel_roundtrip_seconds_bucket{exchange=~\"$exchange\"}[5m]))",
+          "legendFormat": "p95 {{exchange}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } }
+    },
+
+    {
+      "id": 103,
+      "type": "row",
+      "title": "Errors & Resources",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false
+    },
+    {
+      "id": 13,
+      "title": "Order Failures",
+      "description": "Failed order attempts grouped by exchange and reason (auth, rate_limit, insufficient_balance, timeout). Spikes here mean money is not being deployed.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "targets": [
+        {
+          "expr": "rate(polyxgemini_order_failed_total{exchange=~\"$exchange\"}[5m])",
+          "legendFormat": "{{exchange}} - {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 50, "drawStyle": "bars", "stacking": { "mode": "normal" }, "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] } }
+    },
+    {
+      "id": 14,
+      "title": "Memory Usage",
+      "description": "Go runtime memory: heap allocation (active objects) vs system total (reserved from OS). Sustained heap growth = memory leak.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
+      "targets": [
+        {
+          "expr": "go_memstats_alloc_bytes{job=\"polyxgemini-bot\"}",
+          "legendFormat": "heap alloc"
+        },
+        {
+          "expr": "go_memstats_sys_bytes{job=\"polyxgemini-bot\"}",
+          "legendFormat": "sys total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 15, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "last"] } }
+    }
+  ],
+  "schemaVersion": 39
+}

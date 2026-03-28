@@ -1,0 +1,422 @@
+{
+  "uid": "polyxgemini-confidence",
+  "title": "PolyxGemini - Confidence Model",
+  "tags": ["polyxgemini", "confidence", "ml"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-3h", "to": "now" },
+  "links": [
+    { "title": "Operations", "url": "/d/polyxgemini-operations", "type": "link", "icon": "bolt", "tooltip": "System health & WebSocket monitoring" },
+    { "title": "Trading", "url": "/d/polyxgemini-trading", "type": "link", "icon": "graph-bar", "tooltip": "PnL, capital, arbitrage & positions" },
+    { "title": "Confidence Model", "url": "/d/polyxgemini-confidence", "type": "link", "icon": "brain", "tooltip": "ML confidence scores & news sources" }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "category",
+        "label": "Category",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(polyxgemini_confidence_score, category)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "source",
+        "label": "News Source",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(polyxgemini_news_last_fetch_timestamp, source)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Model Overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Avg Confidence",
+      "description": "Average confidence score across all scored markets. Low average may indicate uncertain market conditions or model degradation.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "avg(polyxgemini_confidence_score{category=~\"$category\"})",
+          "legendFormat": "avg"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.7 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 2,
+      "title": "Markets Scored",
+      "description": "Number of markets currently receiving a confidence score from the ML model.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        {
+          "expr": "count(polyxgemini_confidence_score{category=~\"$category\"})",
+          "legendFormat": "markets"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 3,
+      "title": "Inference Latency (p95)",
+      "description": "95th percentile model inference time. Should be well under 500ms to not bottleneck arb execution.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(polyxgemini_confidence_inference_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value" }
+    },
+    {
+      "id": 4,
+      "title": "News Sources Active",
+      "description": "Number of news sources that have reported data in the last 5 minutes. Zero = no news pipeline running.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        {
+          "expr": "count(time() - polyxgemini_news_last_fetch_timestamp < 300)",
+          "legendFormat": "active"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 3 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "none", "textMode": "value", "colorMode": "background", "justifyMode": "center" }
+    },
+
+    {
+      "id": 301,
+      "type": "row",
+      "title": "Confidence Scores",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "title": "Confidence by Market",
+      "description": "Current confidence score for each market. Red <0.3, orange <0.5, yellow <0.7, green >=0.7. Higher confidence = stronger signal for arb trades.",
+      "type": "bargauge",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "polyxgemini_confidence_score{category=~\"$category\"}",
+          "legendFormat": "{{market}} ({{category}})",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.7 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true,
+        "minVizWidth": 0,
+        "minVizHeight": 20,
+        "namePlacement": "left",
+        "valueMode": "text"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Score Distribution",
+      "description": "Histogram of all current confidence scores. Bimodal = model is decisive. Clustered in middle = model is uncertain. Want to see scores pushed to extremes.",
+      "type": "histogram",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        {
+          "expr": "polyxgemini_confidence_score{category=~\"$category\"}",
+          "legendFormat": "{{market}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "bucketSize": 0.1,
+        "combine": true,
+        "fillOpacity": 70
+      }
+    },
+
+    {
+      "id": 302,
+      "type": "row",
+      "title": "Scores Over Time",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "title": "Confidence Scores Over Time",
+      "description": "Timeseries of confidence scores per market. Look for: sudden drops (breaking news changed outlook), gradual convergence (market becoming more certain), divergence from exchange prices (potential opportunity).",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 18 },
+      "targets": [
+        {
+          "expr": "polyxgemini_confidence_score{category=~\"$category\"}",
+          "legendFormat": "{{market}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "gradientMode": "scheme", "spanNulls": true, "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "last", "min", "max"] } }
+    },
+
+    {
+      "id": 303,
+      "type": "row",
+      "title": "Model Performance",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "collapsed": false
+    },
+    {
+      "id": 8,
+      "title": "Inference Latency",
+      "description": "Full latency percentile breakdown for ML model inference. p99 spikes indicate the model is struggling with certain inputs.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(polyxgemini_confidence_inference_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(polyxgemini_confidence_inference_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(polyxgemini_confidence_inference_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 10, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 9,
+      "title": "News Source Freshness",
+      "description": "How recently each news source provided data. Green <60s, yellow <5min, red >5min. Stale sources degrade model accuracy.",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        {
+          "expr": "time() - polyxgemini_news_last_fetch_timestamp{source=~\"$source\"}",
+          "legendFormat": "{{source}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "renameByName": { "source": "Source", "Value": "Age" },
+            "indexByName": { "Source": 0, "Age": 1 }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "sort": [{ "field": "Age", "desc": true }] }
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Source" },
+            "properties": [{ "id": "custom.width", "value": 200 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Age" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 60 },
+                    { "color": "red", "value": 300 }
+                  ]
+                }
+              },
+              { "id": "custom.displayMode", "value": "color-background-solid" }
+            ]
+          }
+        ]
+      }
+    },
+
+    {
+      "id": 304,
+      "type": "row",
+      "title": "Signal Quality",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "News Source Errors",
+      "description": "Rate of errors fetching from each news source. Sustained errors mean a data pipeline is broken and confidence scores are based on incomplete data.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "targets": [
+        {
+          "expr": "rate(polyxgemini_news_errors_total{source=~\"$source\"}[5m])",
+          "legendFormat": "{{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 40, "drawStyle": "bars", "showPoints": "never" },
+          "color": { "mode": "fixed", "fixedColor": "red" }
+        }
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] } }
+    },
+    {
+      "id": 11,
+      "title": "Confidence vs Arb Spread",
+      "description": "Overlay: confidence score (left axis, 0-1) vs arb spread (right axis, %). High confidence + wide spread = strongest trade signal. Look for moments where both lines peak together.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "targets": [
+        {
+          "expr": "polyxgemini_confidence_score{category=~\"$category\"}",
+          "legendFormat": "confidence: {{market}}"
+        },
+        {
+          "expr": "polyxgemini_arb_spread_bps / 100",
+          "legendFormat": "spread: {{pair}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "gradientMode": "scheme", "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "confidence.*" },
+            "properties": [
+              { "id": "custom.axisPlacement", "value": "left" },
+              { "id": "custom.axisLabel", "value": "Confidence (0-1)" },
+              { "id": "min", "value": 0 },
+              { "id": "max", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "spread.*" },
+            "properties": [
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.axisLabel", "value": "Spread (%)" },
+              { "id": "unit", "value": "percentunit" },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": { "tooltip": { "mode": "all", "sort": "desc" }, "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "last"] } }
+    }
+  ],
+  "schemaVersion": 39
+}
