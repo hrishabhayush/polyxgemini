@@ -388,13 +388,9 @@ def _post_predict(server: str, payload: dict) -> dict:
         return json.loads(r.read())
 
 
-def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict, dict]:
-    """Shared feature assembly for one-shot and live loops."""
-    events = replay_game(pbp)
-    if not events:
-        raise ValueError("No usable play-by-play events with score/clock data")
-    snapshot = compute_snapshot_from_events(events, meta)
-    payload = {
+def _build_payload_from_snapshot(snapshot: dict, poly_feats: dict) -> dict:
+    """Build ML payload from a pre-computed snapshot + poly features."""
+    return {
         "time_remaining_sec": float(snapshot["time_remaining_sec"]),
         "period": int(snapshot["period"]),
         "score_diff": int(snapshot["score_diff"]),
@@ -411,6 +407,15 @@ def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict
         "poly_trade_count_5m": int(poly_feats["poly_trade_count_5m"]),
         "has_poly": int(poly_feats["has_poly"]),
     }
+
+
+def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict, dict]:
+    """Shared feature assembly for one-shot and live loops."""
+    events = replay_game(pbp)
+    if not events:
+        raise ValueError("No usable play-by-play events with score/clock data")
+    snapshot = compute_snapshot_from_events(events, meta)
+    payload = _build_payload_from_snapshot(snapshot, poly_feats)
     return snapshot, payload
 
 
@@ -499,11 +504,12 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
     meta0 = _merge_scoreboard_meta(meta0, game_sb)
 
-    # Demo mode: load historical Polymarket data for replay
+    # Demo mode: load historical Polymarket data + pre-compute all PBP events for replay
     demo_price_list: list[tuple[float, float]] | None = None
     demo_trade_list: list[dict] | None = None
     demo_start_epoch: float = 0.0
     demo_max_time: float = 2400.0
+    demo_all_events: list | None = None
     demo_mode = bool(getattr(args, "demo", None))
     if demo_mode:
         with open(args.demo) as f:
@@ -512,7 +518,18 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
         demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
         demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
         demo_title = demo_record.get("meta", {}).get("title", args.demo)
-        print(f"[DEMO] Replaying market data from {demo_title}", flush=True)
+        # Pre-load all PBP events so we can step through them
+        pbp_init = _fetch_pbp_with_retries(str(game_id))
+        if not pbp_init:
+            raise RuntimeError("Could not fetch play-by-play for demo replay")
+        demo_all_events = replay_game(pbp_init)
+        if not demo_all_events:
+            raise RuntimeError("No usable PBP events for demo replay")
+        print(
+            f"[DEMO] Replaying market data from {demo_title} "
+            f"({len(demo_all_events)} PBP events)",
+            flush=True,
+        )
 
     slugs_cache: list[str] | None = None
     if not demo_mode and not args.poly_slug and not args.no_poly:
@@ -576,6 +593,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
     )
 
     iteration = 0
+    demo_cursor = 0  # index into demo_all_events
     last_fp: tuple | None = None
 
     try:
@@ -585,47 +603,46 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 print("Stopping: max-iterations reached.", flush=True)
                 break
 
-            pbp = _fetch_pbp_with_retries(str(game_id))
-            if not pbp:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: PBP fetch failed; retrying...", flush=True)
-                time.sleep(args.interval_sec)
-                continue
-
-            meta = _meta_from_pbp(str(game_id), pbp, date_str=args.date)
-            meta = _merge_scoreboard_meta(meta, game_sb)
-
-            if stop_on_final and _pbp_indicates_final(pbp):
-                print("Game status is final; stopping live loop.", flush=True)
-                break
-
-            poly_feats = {**DEFAULT_POLY_FEATS}
             if demo_mode:
-                # Peek at time_remaining to serve clock-aligned demo features
-                try:
-                    _events = replay_game(pbp)
-                    _snap = compute_snapshot_from_events(_events, meta) if _events else None
-                except Exception:
-                    _snap = None
-                if _snap:
-                    poly_feats = _demo_poly_features(
-                        float(_snap["time_remaining_sec"]),
-                        demo_max_time,
-                        demo_start_epoch,
-                        demo_price_list,
-                        demo_trade_list,
-                    )
-            elif not args.no_poly:
-                if slug:
-                    poly_feats = _fetch_live_polymarket_features(meta, slug)
-                else:
-                    poly_feats = {**DEFAULT_POLY_FEATS}
+                # Step through pre-loaded events instead of fetching live PBP
+                demo_cursor += 1
+                if demo_cursor > len(demo_all_events):
+                    print("[DEMO] All PBP events replayed; stopping.", flush=True)
+                    break
+                current_events = demo_all_events[:demo_cursor]
+                snapshot = compute_snapshot_from_events(current_events, meta0)
+                poly_feats = _demo_poly_features(
+                    float(snapshot["time_remaining_sec"]),
+                    demo_max_time,
+                    demo_start_epoch,
+                    demo_price_list,
+                    demo_trade_list,
+                )
+                payload = _build_payload_from_snapshot(snapshot, poly_feats)
+            else:
+                pbp = _fetch_pbp_with_retries(str(game_id))
+                if not pbp:
+                    print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: PBP fetch failed; retrying...", flush=True)
+                    time.sleep(args.interval_sec)
+                    continue
 
-            try:
-                snapshot, payload = build_predict_payload(meta, pbp, poly_feats)
-            except ValueError as e:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: {e}", flush=True)
-                time.sleep(args.interval_sec)
-                continue
+                meta0 = _meta_from_pbp(str(game_id), pbp, date_str=args.date)
+                meta0 = _merge_scoreboard_meta(meta0, game_sb)
+
+                if stop_on_final and _pbp_indicates_final(pbp):
+                    print("Game status is final; stopping live loop.", flush=True)
+                    break
+
+                poly_feats = {**DEFAULT_POLY_FEATS}
+                if not args.no_poly and slug:
+                    poly_feats = _fetch_live_polymarket_features(meta0, slug)
+
+                try:
+                    snapshot, payload = build_predict_payload(meta0, pbp, poly_feats)
+                except ValueError as e:
+                    print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: {e}", flush=True)
+                    time.sleep(args.interval_sec)
+                    continue
 
             fp = _fingerprint(snapshot, payload)
             if args.skip_duplicate_lines and fp == last_fp:
@@ -650,8 +667,8 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             engine_suffix = ""
             risk_suffix = ""
             if engine is not None:
-                events = replay_game(pbp)
-                tr = engine.tick(snapshot, payload, result, events)
+                current_events = demo_all_events[:demo_cursor] if demo_mode else replay_game(pbp)
+                tr = engine.tick(snapshot, payload, result, current_events)
                 engine_suffix = (
                     f" | {tr.state.value} ema={tr.ema_edge:+.4f} "
                     f"nL={tr.normalised_lead:+.2f} eps={tr.epsilon_eff:.3f} "
