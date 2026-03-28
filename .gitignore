@@ -34,3 +34,5 @@ python/ml/artifacts/
 # Grafana / Prometheus persistent data (managed by Docker volumes)
 grafana-data/
 prometheus-data/
+
+config/markets.yaml

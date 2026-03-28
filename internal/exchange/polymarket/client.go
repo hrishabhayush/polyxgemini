@@ -591,9 +591,19 @@ func (c *Client) ResolveMarket(ctx context.Context, slug string) (*ResolvedMarke
 		return nil, fmt.Errorf("no market found for slug: %s", slug)
 	}
 
-	rm := toResolvedMarket(markets[0])
+	m := markets[0]
+	var tokenIDs []string
+	if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil {
+		return nil, fmt.Errorf("market %s: clobTokenIds: %w", slug, err)
+	}
+	if len(tokenIDs) != 2 {
+		return nil, fmt.Errorf("market %s: want 2 clob token IDs, got %d", slug, len(tokenIDs))
+	}
+
+	rm := toResolvedMarket(m)
 	if rm == nil {
-		return nil, fmt.Errorf("market %s has malformed token IDs", slug)
+		// Team-name outcomes (e.g. ["Illinois","Iowa"]) are not Yes/No; same as ResolveEvent fallback.
+		rm = buildResolvedMarket(m, tokenIDs)
 	}
 	return rm, nil
 }
