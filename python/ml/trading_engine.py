@@ -145,30 +145,40 @@ _FOUL_RE = re.compile(r"\b(foul|personal|technical|flagrant)\b", re.IGNORECASE)
 _TIMEOUT_RE = re.compile(r"\b(timeout|time.?out)\b", re.IGNORECASE)
 
 
-def _detect_foul_storm(events: list[dict], time_remaining_sec: float) -> bool:
-    """3+ fouls within 2 minutes of game clock ending at or after current time."""
+def _detect_foul_storm(
+    events: list[dict],
+    time_remaining_sec: float,
+    foul_count: int = 3,
+    foul_window_sec: float = 120.0,
+    proximity_sec: float = 90.0,
+) -> bool:
+    """N+ fouls within a sliding game-clock window near current time."""
     foul_times: list[float] = []
     for ev in events:
         if _FOUL_RE.search(ev.get("event_text", "")):
             foul_times.append(ev["time_remaining_sec"])
     foul_times.sort(reverse=True)
-    # Sliding window: any window of 120 s containing 3+ fouls that overlaps now
     for i in range(len(foul_times)):
         window_start = foul_times[i]
-        window_end = window_start - 120.0
+        window_end = window_start - foul_window_sec
         count = 0
         for ft in foul_times[i:]:
             if ft >= window_end:
                 count += 1
             else:
                 break
-        if count >= 3 and window_start >= time_remaining_sec >= max(window_end - 90.0, 0.0):
+        if count >= foul_count and window_start >= time_remaining_sec >= max(window_end - proximity_sec, 0.0):
             return True
     return False
 
 
-def _detect_timeout_cluster(events: list[dict], time_remaining_sec: float) -> bool:
-    """Back-to-back timeouts within 90 seconds of game clock."""
+def _detect_timeout_cluster(
+    events: list[dict],
+    time_remaining_sec: float,
+    gap_sec: float = 90.0,
+    proximity_sec: float = 90.0,
+) -> bool:
+    """Back-to-back timeouts within gap_sec of game clock near current time."""
     to_times: list[float] = []
     for ev in events:
         if _TIMEOUT_RE.search(ev.get("event_text", "")):
@@ -176,37 +186,62 @@ def _detect_timeout_cluster(events: list[dict], time_remaining_sec: float) -> bo
     to_times.sort(reverse=True)
     for i in range(len(to_times) - 1):
         gap = to_times[i] - to_times[i + 1]
-        if gap <= 90.0:
-            # Check proximity to current time
-            if to_times[i] >= time_remaining_sec >= to_times[i + 1] - 90.0:
+        if gap <= gap_sec:
+            if to_times[i] >= time_remaining_sec >= to_times[i + 1] - proximity_sec:
                 return True
     return False
 
 
-def _end_of_quarter(period: int, time_remaining_sec: float, regulation_secs: float = 2400.0) -> bool:
-    """Last 60 seconds of any quarter (or half for men's)."""
-    # Quarter length
+def _end_of_quarter(
+    period: int,
+    time_remaining_sec: float,
+    regulation_secs: float = 2400.0,
+    window_sec: float = 60.0,
+) -> bool:
+    """Last window_sec seconds of any quarter (or half for men's)."""
     if regulation_secs >= 2000 and period <= 2:
         quarter_len = 1200.0  # half
     else:
         quarter_len = 600.0
     secs_in_q = time_remaining_sec % quarter_len if quarter_len > 0 else time_remaining_sec
-    return secs_in_q <= 60.0
+    return secs_in_q <= window_sec
 
 
-def _early_blowout(period: int, score_diff: int, time_remaining_sec: float, regulation_secs: float = 2400.0) -> bool:
-    """Q1 lead >= 10, or Q2 lead >= 18."""
+def _early_blowout(
+    period: int,
+    score_diff: int,
+    time_remaining_sec: float,
+    regulation_secs: float = 2400.0,
+    blowout_q1: int = 10,
+    blowout_q2: int = 18,
+) -> bool:
+    """Lead exceeds threshold for current quarter."""
     ad = abs(score_diff)
     if regulation_secs >= 2000 and period <= 2:
         # Men's halves: period 1 ≈ Q1+Q2; map by remaining time
         if time_remaining_sec > 1200:
-            return ad >= 10
-        return ad >= 18
+            return ad >= blowout_q1
+        return ad >= blowout_q2
 
     if period == 1:
-        return ad >= 10
+        return ad >= blowout_q1
     if period == 2:
-        return ad >= 18
+        return ad >= blowout_q2
+    return False
+
+
+def _has_recent_disruptions(
+    events: list[dict],
+    time_remaining_sec: float,
+    window_sec: float,
+) -> bool:
+    """Check if any fouls or timeouts occurred within window_sec of current clock."""
+    for ev in events:
+        text = ev.get("event_text", "")
+        if _FOUL_RE.search(text) or _TIMEOUT_RE.search(text):
+            ev_time = ev["time_remaining_sec"]
+            if abs(ev_time - time_remaining_sec) <= window_sec:
+                return True
     return False
 
 
@@ -215,17 +250,39 @@ def _early_blowout(period: int, score_diff: int, time_remaining_sec: float, regu
 # ---------------------------------------------------------------------------
 
 @dataclass
+class DeadZoneConfig:
+    """Configurable thresholds for regime gate dead zones."""
+    # End-of-quarter: last N seconds of each quarter/half
+    end_of_quarter_sec: float = 60.0
+    # Early blowout: lead thresholds per quarter (or mapped half)
+    blowout_q1: int = 10
+    blowout_q2: int = 18
+    # Foul storm: N fouls within a sliding window
+    foul_count: int = 3
+    foul_window_sec: float = 120.0
+    foul_proximity_sec: float = 90.0  # how close to current clock the window must be
+    # Timeout cluster: back-to-back timeouts within N seconds
+    timeout_gap_sec: float = 90.0
+    timeout_proximity_sec: float = 90.0
+    # Clean play re-entry: seconds of foul/timeout-free play after dead zone
+    clean_play_sec: float = 120.0
+    # Whether clean play window must be truly clean (no fouls/TOs) vs just elapsed time
+    clean_play_strict: bool = True
+
+
+@dataclass
 class _EngineConfig:
     epsilon_base: float = 0.04
     epsilon_time_k: float = 1.0
     persistence_sec: float = 45.0
     cooldown_sec: float = 180.0  # 3 minutes
     ema_span: int = 25
-    clean_play_sec: float = 120.0  # 2 minutes required after dead zone
     regulation_secs: float = 2400.0
     trade_log_path: str = "data/trade_log.jsonl"
     # Min wall seconds between execute signals (None = no limit).
     min_seconds_between_executes: float | None = None
+    # Dead zone configuration
+    dead_zone: DeadZoneConfig | None = None
 
 
 class TradingEngine:
@@ -242,7 +299,9 @@ class TradingEngine:
         trade_log_path: str = "data/trade_log.jsonl",
         regulation_secs: float = 2400.0,
         min_seconds_between_executes: float | None = None,
+        dead_zone_config: DeadZoneConfig | None = None,
     ):
+        dz_cfg = dead_zone_config or DeadZoneConfig()
         self._cfg = _EngineConfig(
             epsilon_base=epsilon_base,
             epsilon_time_k=epsilon_time_k,
@@ -252,6 +311,7 @@ class TradingEngine:
             regulation_secs=regulation_secs,
             trade_log_path=trade_log_path,
             min_seconds_between_executes=min_seconds_between_executes,
+            dead_zone=dz_cfg,
         )
         self._interval = interval_sec
         self._k_ticks = max(1, math.ceil(persistence_sec / interval_sec))
@@ -309,6 +369,7 @@ class TradingEngine:
 
         # Regime gate
         dz = self._check_dead_zones(events, period, t_rem, score_diff)
+        dz_cfg = self._cfg.dead_zone
 
         # State machine transition
         if dz:
@@ -319,9 +380,16 @@ class TradingEngine:
             self._dead_zone_clear_elapsed = 0.0
         else:
             if self._last_dead_zone:
-                self._dead_zone_clear_elapsed += self._interval
-                if self._dead_zone_clear_elapsed < self._cfg.clean_play_sec:
-                    dz = f"clean_play_wait({self._dead_zone_clear_elapsed:.0f}/{self._cfg.clean_play_sec:.0f}s)"
+                # In strict mode, any foul/timeout during the clean play window resets the counter
+                if dz_cfg.clean_play_strict and events and _has_recent_disruptions(
+                    events, t_rem, self._dead_zone_clear_elapsed
+                ):
+                    self._dead_zone_clear_elapsed = 0.0
+                else:
+                    self._dead_zone_clear_elapsed += self._interval
+
+                if self._dead_zone_clear_elapsed < dz_cfg.clean_play_sec:
+                    dz = f"clean_play_wait({self._dead_zone_clear_elapsed:.0f}/{dz_cfg.clean_play_sec:.0f}s)"
                 else:
                     self._last_dead_zone = False
                     self._dead_zone_clear_elapsed = 0.0
@@ -365,14 +433,27 @@ class TradingEngine:
     def _check_dead_zones(
         self, events: list[dict], period: int, t_rem: float, score_diff: int,
     ) -> str:
-        if _end_of_quarter(period, t_rem, self._cfg.regulation_secs):
+        dz = self._cfg.dead_zone
+        if _end_of_quarter(period, t_rem, self._cfg.regulation_secs, window_sec=dz.end_of_quarter_sec):
             return "end_of_quarter"
-        if _early_blowout(period, score_diff, t_rem, self._cfg.regulation_secs):
+        if _early_blowout(
+            period, score_diff, t_rem, self._cfg.regulation_secs,
+            blowout_q1=dz.blowout_q1, blowout_q2=dz.blowout_q2,
+        ):
             return "early_blowout"
         if events:
-            if _detect_foul_storm(events, t_rem):
+            if _detect_foul_storm(
+                events, t_rem,
+                foul_count=dz.foul_count,
+                foul_window_sec=dz.foul_window_sec,
+                proximity_sec=dz.foul_proximity_sec,
+            ):
                 return "foul_storm"
-            if _detect_timeout_cluster(events, t_rem):
+            if _detect_timeout_cluster(
+                events, t_rem,
+                gap_sec=dz.timeout_gap_sec,
+                proximity_sec=dz.timeout_proximity_sec,
+            ):
                 return "timeout_cluster"
         return ""
 
