@@ -82,19 +82,21 @@ def _enrich_price_list(
     combined: dict[float, float] = {}
     for ts, price in price_list:
         combined[ts] = price
-    # Determine the "anchor" price from the existing series (exclude terminal 0/1)
-    existing_prices = [p for _, p in price_list if 0.01 < p < 0.99]
+    # Determine valid price band from the existing pre-game series (exclude terminal 0/1)
+    existing_prices = [p for _, p in price_list if 0.02 < p < 0.98]
     if not existing_prices:
         return sorted(combined.items(), key=lambda x: x[0])
-    anchor = sorted(existing_prices)[len(existing_prices) // 2]
+    lo = min(existing_prices)
+    hi = max(existing_prices)
+    # Allow 2x the range as margin (prices can move beyond pre-game, but not to dust)
+    band = max(hi - lo, 0.10)
+    floor = max(0.01, lo - band)
+    ceil = min(0.99, hi + band)
     for t in trade_list:
         ts, price = t["ts"], t["price"]
         if ts <= 0 or price <= 0:
             continue
-        # Keep trade if it's closer to anchor than to (1 - anchor)
-        dist_same = abs(price - anchor)
-        dist_other = abs(price - (1.0 - anchor))
-        if dist_same <= dist_other:
+        if floor <= price <= ceil:
             combined[ts] = price
     return sorted(combined.items(), key=lambda x: x[0])
 
@@ -770,11 +772,18 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                             portfolio.reduce_position(abs(directive.delta_qty), books)
                             risk.on_fill(directive.delta_qty, tick_side)
                     else:
-                        # Curve-driven rebalance (trimming) every tick
-                        directive = risk.check_rebalance(t_norm, now_mono)
+                        # Curve-driven rebalance every tick (both scale-up and trim)
+                        directive = risk.check_rebalance(t_norm, now_mono, allow_scale_up=True)
                         if directive.action == "reduce" and directive.delta_qty < 0:
                             portfolio.reduce_position(abs(directive.delta_qty), books)
                             risk.on_fill(directive.delta_qty, risk._actual_side or tick_side)
+                        elif directive.action == "buy" and directive.delta_qty > 0:
+                            portfolio.on_execute(
+                                tick_side, books,
+                                ema_edge=tr.ema_edge, ts_iso=ts,
+                                qty=directive.delta_qty,
+                            )
+                            risk.on_fill(directive.delta_qty, tick_side)
 
                     portfolio.mark_to_market(books)
                     rs = risk.status(t_norm, now_mono)

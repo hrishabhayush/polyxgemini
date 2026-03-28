@@ -184,26 +184,31 @@ class RiskEngine:
         else:
             return OrderDirective("reduce", delta, target, reason="curve_trim")
 
-    def check_rebalance(self, t_norm: float, wall_time: float) -> OrderDirective:
+    def check_rebalance(self, t_norm: float, wall_time: float, *, allow_scale_up: bool = False) -> OrderDirective:
         """
-        Called every tick (even without execute signal) for curve-driven trimming.
-        Only produces reduce orders when the curve has moved below current position.
+        Called every tick (even without execute signal) for curve-driven rebalancing.
+        Always trims when over target. Optionally scales up when under target.
         """
-        if self._actual_qty <= 0:
-            return OrderDirective("none", 0.0, 0.0, reason="flat")
-
         if self.in_consolidation(wall_time):
-            return OrderDirective("hold", 0.0, self._actual_qty, reason="consolidation_freeze")
+            if self._actual_qty > 0:
+                return OrderDirective("hold", 0.0, self._actual_qty, reason="consolidation_freeze")
+            return OrderDirective("none", 0.0, 0.0, reason="consolidation_freeze")
 
         target = self.target_position(t_norm, wall_time)
         target = max(0.0, target)
         delta = target - self._actual_qty
 
-        # Only trim down (never buy on rebalance — buys come from evaluate())
-        if delta >= -self.cfg.rebalance_threshold:
-            return OrderDirective("hold", 0.0, self._actual_qty, reason="no_trim_needed")
+        # Trim down
+        if delta < -self.cfg.rebalance_threshold:
+            return OrderDirective("reduce", delta, target, reason="curve_trim_rebalance")
 
-        return OrderDirective("reduce", delta, target, reason="curve_trim_rebalance")
+        # Scale up (only if enabled and there's meaningful gap)
+        if allow_scale_up and delta > self.cfg.rebalance_threshold and self._actual_qty >= 0:
+            return OrderDirective("buy", delta, target, reason="curve_scale_up")
+
+        if self._actual_qty > 0:
+            return OrderDirective("hold", 0.0, self._actual_qty, reason="no_rebalance_needed")
+        return OrderDirective("none", 0.0, 0.0, reason="flat")
 
     # ------------------------------------------------------------------
     # Event handlers
