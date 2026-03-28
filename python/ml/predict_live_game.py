@@ -493,13 +493,10 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             cooldown_min=getattr(args, "cooldown_min", 3.0),
             ema_span=getattr(args, "ema_span", 25),
             trade_log_path=getattr(args, "trade_log", "data/trade_log.jsonl"),
-            force_no_guardrails=getattr(args, "disable_trade_guardrails", False),
             min_seconds_between_executes=getattr(args, "trade_interval_sec", None),
         )
 
     engine_label = " | trade_engine=ON" if use_engine else ""
-    if use_engine and getattr(args, "disable_trade_guardrails", False):
-        engine_label += " | GUARDRAILS=OFF(debug)"
     if use_engine and getattr(args, "trade_interval_sec", None) is not None:
         engine_label += f" | min_trade_interval={args.trade_interval_sec:g}s"
     print(
@@ -669,15 +666,10 @@ def main():
         help="Enable trading decision engine (regime gate, EMA, persistence, state machine)",
     )
     parser.add_argument(
-        "--disable-trade-guardrails",
-        action="store_true",
-        help="With --trade-engine: trade on current prediction only; ignores dead zones, edge, persistence, cooldown (debug; not default). Default min time between executes is 30s unless --trade-interval-sec is set.",
-    )
-    parser.add_argument(
         "--trade-interval-sec",
         type=float,
         default=None,
-        help="Minimum seconds between execute signals (default: 30 with --disable-trade-guardrails; omit for no cap in normal engine mode)",
+        help="Optional minimum seconds between EXECUTE signals (wall clock; still requires full guardrails)",
     )
     parser.add_argument(
         "--epsilon-base",
@@ -713,13 +705,6 @@ def main():
 
     if args.trade_interval_sec is not None and args.trade_interval_sec <= 0:
         print("--trade-interval-sec must be positive.", file=sys.stderr)
-        sys.exit(2)
-
-    if args.disable_trade_guardrails and args.trade_interval_sec is None:
-        args.trade_interval_sec = 30.0
-
-    if args.disable_trade_guardrails and not args.trade_engine:
-        print("--disable-trade-guardrails requires --trade-engine.", file=sys.stderr)
         sys.exit(2)
 
     stop_on_final = not args.no_stop_on_final
