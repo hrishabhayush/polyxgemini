@@ -69,6 +69,36 @@ DEFAULT_POLY_FEATS = {
 }
 
 
+def _enrich_price_list(
+    price_list: list[tuple[float, float]],
+    trade_list: list[dict],
+) -> list[tuple[float, float]]:
+    """Build a dense price timeline by merging sparse price snapshots with trade prices.
+
+    Only includes trades whose price is closer to the existing price series
+    than to its complement (1 - price). This correctly filters out trades
+    on the opposite token.
+    """
+    combined: dict[float, float] = {}
+    for ts, price in price_list:
+        combined[ts] = price
+    # Determine the "anchor" price from the existing series (exclude terminal 0/1)
+    existing_prices = [p for _, p in price_list if 0.01 < p < 0.99]
+    if not existing_prices:
+        return sorted(combined.items(), key=lambda x: x[0])
+    anchor = sorted(existing_prices)[len(existing_prices) // 2]
+    for t in trade_list:
+        ts, price = t["ts"], t["price"]
+        if ts <= 0 or price <= 0:
+            continue
+        # Keep trade if it's closer to anchor than to (1 - anchor)
+        dist_same = abs(price - anchor)
+        dist_other = abs(price - (1.0 - anchor))
+        if dist_same <= dist_other:
+            combined[ts] = price
+    return sorted(combined.items(), key=lambda x: x[0])
+
+
 def _demo_poly_features(
     time_remaining_sec: float,
     max_time: float,
@@ -516,6 +546,8 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             demo_record = json.load(f)
         demo_poly = demo_record.get("polymarket", {})
         demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
+        # Enrich sparse price snapshots with trade execution prices
+        demo_price_list = _enrich_price_list(demo_price_list, demo_trade_list)
         demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
         demo_title = demo_record.get("meta", {}).get("title", args.demo)
         # Pre-load all PBP events so we can step through them
@@ -613,6 +645,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
     iteration = 0
     demo_cursor = 0  # index into demo_all_events
     last_fp: tuple | None = None
+    prev_t_rem: float | None = None  # for computing game clock delta in demo mode
 
     try:
         while True:
@@ -687,9 +720,16 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             tr = None
             rs = None
             t_norm = 0.0
+            # Compute game clock delta for demo mode
+            cur_t_rem = float(snapshot["time_remaining_sec"])
+            clock_delta = None
+            if demo_mode and prev_t_rem is not None:
+                clock_delta = max(0.0, prev_t_rem - cur_t_rem)
+            prev_t_rem = cur_t_rem
+
             if engine is not None:
                 current_events = demo_all_events[:demo_cursor] if demo_mode else replay_game(pbp)
-                tr = engine.tick(snapshot, payload, result, current_events)
+                tr = engine.tick(snapshot, payload, result, current_events, clock_delta=clock_delta)
                 engine_suffix = (
                     f" | {tr.state.value} ema={tr.ema_edge:+.4f} "
                     f"nL={tr.normalised_lead:+.2f} eps={tr.epsilon_eff:.3f} "
@@ -768,6 +808,17 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 pm.hedge_realised_pnl.set(portfolio.realised_pnl)
                 pm.hedge_unrealised_pnl.set(portfolio.unrealised_pnl)
                 pm.hedge_combined_pnl.set(portfolio.realised_pnl + portfolio.unrealised_pnl)
+                # Trade-level metrics
+                pm.trade_position_qty.set(portfolio.qty)
+                pm.trade_entry_price.set(portfolio.entry_price if portfolio.qty > 0 else 0)
+                side_val = 0
+                if portfolio.position == "HOME":
+                    side_val = 1
+                elif portfolio.position == "AWAY":
+                    side_val = -1
+                pm.trade_position_side.set(side_val)
+                if tr.action == "execute":
+                    pm.trade_total_count.inc()
 
             print(
                 f"{ts} | t_rem={snapshot['time_remaining_sec']:.0f}s P{snapshot['period']} | "
@@ -795,6 +846,7 @@ def run_one_shot(args) -> None:
             demo_record = json.load(f)
         demo_poly = demo_record.get("polymarket", {})
         demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
+        demo_price_list = _enrich_price_list(demo_price_list, demo_trade_list)
         demo_max_time = 2400.0
         demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
         demo_title = demo_record.get("meta", {}).get("title", args.demo)

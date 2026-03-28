@@ -83,6 +83,24 @@ trading_time_remaining = Gauge(
     "Game clock seconds remaining.",
 )
 
+# ---- Trade events ----
+trade_entry_price = Gauge(
+    "polyxgemini_trade_entry_price",
+    "Entry price of last trade.",
+)
+trade_position_side = Gauge(
+    "polyxgemini_trade_position_side",
+    "Current position: 1=HOME, -1=AWAY, 0=FLAT.",
+)
+trade_position_qty = Gauge(
+    "polyxgemini_trade_position_qty",
+    "Current open contract quantity.",
+)
+trade_total_count = Counter(
+    "polyxgemini_trade_total_count",
+    "Total trades executed.",
+)
+
 STATE_MAP = {
     "IDLE": 0,
     "WATCHING": 1,

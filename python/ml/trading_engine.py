@@ -348,10 +348,16 @@ class TradingEngine:
         payload: dict,
         predict_result: dict,
         events: list[dict],
+        *,
+        clock_delta: float | None = None,
     ) -> TickResult:
-        """Process one tick. Returns state, action, and optional log entry."""
+        """Process one tick. Returns state, action, and optional log entry.
 
+        clock_delta: if set, overrides self._interval for dead-zone and cooldown
+                     timers (used by demo replay where wall-clock != game-clock).
+        """
         self._now_mono = time.monotonic()
+        effective_interval = clock_delta if clock_delta is not None else self._interval
 
         period = int(snapshot.get("period", 1))
         t_rem = float(snapshot.get("time_remaining_sec", 2400))
@@ -391,7 +397,7 @@ class TradingEngine:
                 ):
                     self._dead_zone_clear_elapsed = 0.0
                 else:
-                    self._dead_zone_clear_elapsed += self._interval
+                    self._dead_zone_clear_elapsed += effective_interval
 
                 if self._dead_zone_clear_elapsed < dz_cfg.clean_play_sec:
                     dz = f"clean_play_wait({self._dead_zone_clear_elapsed:.0f}/{dz_cfg.clean_play_sec:.0f}s)"
@@ -404,7 +410,7 @@ class TradingEngine:
 
         # Decrement cooldown
         if self._state == State.COOLDOWN:
-            self._cooldown_remaining -= self._interval
+            self._cooldown_remaining -= effective_interval
             if self._cooldown_remaining <= 0:
                 self._cooldown_remaining = 0
                 self._in_hysteresis = True

@@ -1,0 +1,180 @@
+{
+  "uid": "polyxgemini-demo",
+  "title": "PolyxGemini - Live Demo",
+  "tags": ["polyxgemini", "demo"],
+  "timezone": "browser",
+  "refresh": "1s",
+  "time": { "from": "now-5m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "row", "title": "Game & Trading", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false
+    },
+    {
+      "id": 11,
+      "title": "Game Clock",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trading_time_remaining_sec / 60", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "unit": "string", "decimals": 0, "color": { "fixedColor": "white", "mode": "fixed" } } },
+      "options": { "colorMode": "value", "textMode": "value", "justifyMode": "center", "graphMode": "none" },
+      "transformations": [],
+      "description": "Minutes remaining"
+    },
+    {
+      "id": 12,
+      "title": "Score Diff",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trading_score_diff", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "#EAB839", "value": -3 }, { "color": "green", "value": 3 }] } } },
+      "options": { "colorMode": "value", "textMode": "value", "justifyMode": "center", "graphMode": "none" }
+    },
+    {
+      "id": 13,
+      "title": "Bot State",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trading_state", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "IDLE", "color": "#888" }, "1": { "text": "WATCHING", "color": "#EAB839" }, "2": { "text": "ARMED", "color": "orange" }, "3": { "text": "EXECUTE", "color": "#73BF69" }, "4": { "text": "COOLDOWN", "color": "#5794F2" } } }] } },
+      "options": { "colorMode": "background", "textMode": "value", "justifyMode": "center", "graphMode": "none" }
+    },
+    {
+      "id": 14,
+      "title": "Position",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trade_position_side", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "FLAT", "color": "#888" }, "1": { "text": "LONG HOME", "color": "#73BF69" }, "-1": { "text": "LONG AWAY", "color": "#F2495C" } } }] } },
+      "options": { "colorMode": "background", "textMode": "value", "justifyMode": "center", "graphMode": "none" }
+    },
+    {
+      "id": 15,
+      "title": "Contracts",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trade_position_qty", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "decimals": 1, "color": { "fixedColor": "white", "mode": "fixed" } } },
+      "options": { "colorMode": "value", "textMode": "value", "justifyMode": "center", "graphMode": "none" }
+    },
+    {
+      "id": 16,
+      "title": "Entry Price",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trade_entry_price", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "decimals": 1, "color": { "fixedColor": "white", "mode": "fixed" } } },
+      "options": { "colorMode": "value", "textMode": "value", "justifyMode": "center", "graphMode": "none" }
+    },
+    {
+      "id": 17,
+      "title": "Total P&L",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_hedge_combined_pnl", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2, "thresholds": { "mode": "absolute", "steps": [{ "color": "#F2495C", "value": null }, { "color": "#73BF69", "value": 0 }] } } },
+      "options": { "colorMode": "value", "textMode": "value_and_sparkline", "justifyMode": "center", "graphMode": "area" }
+    },
+    {
+      "id": 18,
+      "title": "Trades",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 1 },
+      "targets": [{ "expr": "polyxgemini_trade_total_count_total", "legendFormat": "" }],
+      "fieldConfig": { "defaults": { "decimals": 0, "color": { "fixedColor": "#5794F2", "mode": "fixed" } } },
+      "options": { "colorMode": "value", "textMode": "value", "justifyMode": "center", "graphMode": "none" }
+    },
+    {
+      "id": 20, "type": "row", "title": "", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "collapsed": false
+    },
+    {
+      "id": 4,
+      "title": "Market Price vs ML Prediction",
+      "description": "Blue = Polymarket price (what the market thinks). Orange = ML model prediction. Gap = our edge.",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 16, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "polyxgemini_trading_poly_price", "legendFormat": "Market (Poly)" },
+        { "expr": "polyxgemini_confidence_score{category=\"ncaa\"}", "legendFormat": "ML Prediction" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "decimals": 1, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "pointSize": 3, "showPoints": "auto", "lineInterpolation": "smooth" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Market (Poly)" }, "properties": [{ "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "ML Prediction" }, "properties": [{ "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] }
+        ]
+      }
+    },
+    {
+      "id": 9,
+      "title": "P&L",
+      "description": "Green = total. Yellow = realised (closed). Blue = unrealised (open).",
+      "type": "timeseries",
+      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 6 },
+      "targets": [
+        { "expr": "polyxgemini_hedge_combined_pnl", "legendFormat": "Total" },
+        { "expr": "polyxgemini_hedge_gemini_realised_pnl", "legendFormat": "Realised" },
+        { "expr": "polyxgemini_hedge_gemini_unrealised_pnl", "legendFormat": "Unrealised" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "decimals": 2, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "lineInterpolation": "smooth" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Total" }, "properties": [{ "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Realised" }, "properties": [{ "id": "color", "value": { "fixedColor": "#EAB839", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Unrealised" }, "properties": [{ "id": "color", "value": { "fixedColor": "#5794F2", "mode": "fixed" } }] }
+        ]
+      }
+    },
+    {
+      "id": 30, "type": "row", "title": "", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }, "collapsed": false
+    },
+    {
+      "id": 7,
+      "title": "Contracts Held",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 17 },
+      "targets": [
+        { "expr": "polyxgemini_trade_position_qty", "legendFormat": "Holding" },
+        { "expr": "polyxgemini_hedge_target_qty", "legendFormat": "Target" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "lineInterpolation": "smooth" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Holding" }, "properties": [{ "id": "color", "value": { "fixedColor": "#FF9830", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Target" }, "properties": [{ "id": "color", "value": { "fixedColor": "#73BF69", "mode": "fixed" } }, { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 5] } }] }
+        ]
+      }
+    },
+    {
+      "id": 6,
+      "title": "Edge (Model vs Market)",
+      "description": "Positive = model sees value the market doesn't. Triggers trades when large enough.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 17 },
+      "targets": [{ "expr": "polyxgemini_trading_ema_edge", "legendFormat": "EMA Edge" }],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "lineInterpolation": "smooth" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#F2495C", "value": null }, { "color": "#73BF69", "value": 0 }] },
+          "color": { "mode": "continuous-GrYlRd" }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Score Differential",
+      "description": "Positive = home leading. Negative = away leading.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 17 },
+      "targets": [{ "expr": "polyxgemini_trading_score_diff", "legendFormat": "Score Diff" }],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 80 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "#F2495C", "value": null }, { "color": "#73BF69", "value": 0 }] },
+          "color": { "mode": "continuous-GrYlRd" }
+        }
+      }
+    }
+  ],
+  "schemaVersion": 39
+}
