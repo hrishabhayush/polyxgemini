@@ -2,10 +2,9 @@ package polymarket
 
 import (
 	"crypto/ecdsa"
+	crand "crypto/rand"
 	"fmt"
 	"math/big"
-	"math/rand"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -35,7 +34,7 @@ var orderTypeHash = crypto.Keccak256Hash([]byte(
 func domainSeparator(exchange string) common.Hash {
 	nameHash := crypto.Keccak256Hash([]byte("Polymarket CTF Exchange"))
 	versionHash := crypto.Keccak256Hash([]byte("1"))
-	chainID := new(big.Int).SetInt64(PolygonChainID)
+	chainID := new(big.Int).SetUint64(uint64(PolygonChainID))
 
 	// EIP-712 domain: keccak256(typeHash || nameHash || versionHash || chainId || verifyingContract)
 	domainTypeHash := crypto.Keccak256Hash([]byte(
@@ -74,11 +73,13 @@ type orderFields struct {
 	SignatureType uint8
 }
 
-func generateSalt() *big.Int {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	now := time.Now().Unix()
-	salt := float64(now) * r.Float64()
-	return new(big.Int).SetInt64(int64(salt))
+// generateSalt returns a random uint256 salt for EIP-712 Order (no float/int64 truncation).
+func generateSalt() (*big.Int, error) {
+	var buf [32]byte
+	if _, err := crand.Read(buf[:]); err != nil {
+		return nil, fmt.Errorf("crypto/rand: %w", err)
+	}
+	return new(big.Int).SetBytes(buf[:]), nil
 }
 
 func structHash(o *orderFields) common.Hash {
@@ -150,8 +151,13 @@ func BuildSignedOrder(
 		}
 	}
 
+	salt, err := generateSalt()
+	if err != nil {
+		return nil, err
+	}
+
 	o := &orderFields{
-		Salt:          generateSalt(),
+		Salt:          salt,
 		Maker:         common.HexToAddress(funderAddress),
 		Signer:        common.HexToAddress(signerAddress),
 		Taker:         common.HexToAddress(ZeroAddress),
@@ -177,7 +183,7 @@ func BuildSignedOrder(
 
 	return &SignedOrderPayload{
 		Order: map[string]any{
-			"salt":          o.Salt.Int64(),
+			"salt":          o.Salt.String(),
 			"maker":         funderAddress,
 			"signer":        signerAddress,
 			"taker":         ZeroAddress,
@@ -220,14 +226,12 @@ func ComputeAmounts(side int, price, size float64) (makerAmount, takerAmount *bi
 		takerAmount, _ = taker.Int(nil)
 	}
 
-	makerAmount = roundDown(makerAmount, 10000)
-	takerAmount = roundDown(takerAmount, 100)
+	makerAmount = roundDown(makerAmount, big.NewInt(10000))
+	takerAmount = roundDown(takerAmount, big.NewInt(100))
 	return
 }
 
-func roundDown(v *big.Int, unit int64) *big.Int {
-	u := big.NewInt(unit)
-	v.Div(v, u)
-	v.Mul(v, u)
-	return v
+func roundDown(v *big.Int, unit *big.Int) *big.Int {
+	q := new(big.Int).Div(v, unit)
+	return q.Mul(q, unit)
 }
