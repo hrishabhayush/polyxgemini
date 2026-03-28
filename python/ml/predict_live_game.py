@@ -8,6 +8,8 @@ Examples:
   python python/ml/predict_live_game.py --from-json data/games/6534602.json
   python python/ml/predict_live_game.py --game-id 6534602 --live --interval-sec 5
   python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine
+  python python/ml/predict_live_game.py --game-id 6534713 --demo data/games/6534602.json
+  python python/ml/predict_live_game.py --game-id 6534713 --live --demo data/games/6534602.json --trade-engine --risk-engine
 """
 
 from __future__ import annotations
@@ -29,6 +31,9 @@ from fetch_games import (
 )
 from in_game_features import (
     compute_snapshot_from_events,
+    infer_game_start_epoch,
+    parse_poly_series,
+    poly_features_at_time,
     replay_game,
 )
 from trading_engine import DeadZoneConfig, TradingEngine
@@ -62,6 +67,23 @@ DEFAULT_POLY_FEATS = {
     "poly_trade_count_5m": 0,
     "has_poly": 0,
 }
+
+
+def _demo_poly_features(
+    time_remaining_sec: float,
+    max_time: float,
+    game_start_epoch: float,
+    price_list: list[tuple[float, float]],
+    trade_list: list[dict],
+) -> dict:
+    """Serve historical Polymarket features aligned to current game clock."""
+    return poly_features_at_time(
+        t_remain=time_remaining_sec,
+        max_time=max_time,
+        game_start_epoch=game_start_epoch,
+        price_list=price_list,
+        trade_list=trade_list,
+    )
 
 
 def _norm(text: str) -> str:
@@ -477,12 +499,27 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
     meta0 = _merge_scoreboard_meta(meta0, game_sb)
 
+    # Demo mode: load historical Polymarket data for replay
+    demo_price_list: list[tuple[float, float]] | None = None
+    demo_trade_list: list[dict] | None = None
+    demo_start_epoch: float = 0.0
+    demo_max_time: float = 2400.0
+    demo_mode = bool(getattr(args, "demo", None))
+    if demo_mode:
+        with open(args.demo) as f:
+            demo_record = json.load(f)
+        demo_poly = demo_record.get("polymarket", {})
+        demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
+        demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
+        demo_title = demo_record.get("meta", {}).get("title", args.demo)
+        print(f"[DEMO] Replaying market data from {demo_title}", flush=True)
+
     slugs_cache: list[str] | None = None
-    if not args.poly_slug and not args.no_poly:
+    if not demo_mode and not args.poly_slug and not args.no_poly:
         slugs_cache = scrape_poly_slugs()
 
     slug = None
-    if not args.no_poly:
+    if not demo_mode and not args.no_poly:
         slug = _resolve_polymarket_slug(meta0, args.poly_slug, slugs_cache)
 
     use_engine = getattr(args, "trade_engine", False)
@@ -531,9 +568,10 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
         engine_label += f" | min_trade_interval={args.trade_interval_sec:g}s"
     if use_risk:
         engine_label += f" | risk_engine=ON (max={risk_cfg.max_contracts} α={risk_cfg.alpha} β={risk_cfg.beta})"
+    poly_source = "demo" if demo_mode else (slug or "none")
     print(
         f"Live loop: game {game_id} | poll={args.interval_sec}s | "
-        f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}{engine_label}",
+        f"stop_on_final={stop_on_final} | poly_source={poly_source}{engine_label}",
         flush=True,
     )
 
@@ -561,7 +599,22 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 break
 
             poly_feats = {**DEFAULT_POLY_FEATS}
-            if not args.no_poly:
+            if demo_mode:
+                # Peek at time_remaining to serve clock-aligned demo features
+                try:
+                    _events = replay_game(pbp)
+                    _snap = compute_snapshot_from_events(_events, meta) if _events else None
+                except Exception:
+                    _snap = None
+                if _snap:
+                    poly_feats = _demo_poly_features(
+                        float(_snap["time_remaining_sec"]),
+                        demo_max_time,
+                        demo_start_epoch,
+                        demo_price_list,
+                        demo_trade_list,
+                    )
+            elif not args.no_poly:
                 if slug:
                     poly_feats = _fetch_live_polymarket_features(meta, slug)
                 else:
@@ -678,11 +731,31 @@ def run_one_shot(args) -> None:
     meta = _merge_scoreboard_meta(meta, game_sb)
 
     poly_feats = {**DEFAULT_POLY_FEATS}
-    if poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
+    demo_mode = bool(getattr(args, "demo", None))
+    if demo_mode:
+        with open(args.demo) as f:
+            demo_record = json.load(f)
+        demo_poly = demo_record.get("polymarket", {})
+        demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
+        demo_max_time = 2400.0
+        demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
+        demo_title = demo_record.get("meta", {}).get("title", args.demo)
+        print(f"[DEMO] Replaying market data from {demo_title}", flush=True)
+        events = replay_game(pbp)
+        if events:
+            snap = compute_snapshot_from_events(events, meta)
+            poly_feats = _demo_poly_features(
+                float(snap["time_remaining_sec"]),
+                demo_max_time,
+                demo_start_epoch,
+                demo_price_list,
+                demo_trade_list,
+            )
+    elif poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
         poly_feats = _poly_from_prefetched(poly_prefetched)
 
     slugs_cache: list[str] | None = None
-    if not args.no_poly and not (poly_prefetched and poly_prefetched.get("found")):
+    if not demo_mode and not args.no_poly and not (poly_prefetched and poly_prefetched.get("found")):
         if not args.poly_slug:
             slugs_cache = scrape_poly_slugs()
         slug = _resolve_polymarket_slug(meta, args.poly_slug, slugs_cache)
@@ -713,6 +786,11 @@ def main():
     parser.add_argument("--from-json", help="Use pre-fetched game JSON file")
     parser.add_argument("--poly-slug", help="Optional Polymarket event slug override")
     parser.add_argument("--no-poly", action="store_true", help="Skip Polymarket fetch")
+    parser.add_argument(
+        "--demo",
+        metavar="PATH",
+        help="Replay historical Polymarket data from a game JSON (implies --no-poly for live API)",
+    )
     parser.add_argument("--require-bracket", action="store_true", default=False)
     parser.add_argument("--server", default="http://127.0.0.1:8766", help="Prediction server URL")
     parser.add_argument(
