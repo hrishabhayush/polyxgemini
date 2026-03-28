@@ -497,11 +497,6 @@ def _fingerprint(snapshot: dict, payload: dict) -> tuple:
 
 
 def run_live_loop(args, *, stop_on_final: bool = True) -> None:
-    prom_port = getattr(args, "prom_port", 9200)
-    if prom_port:
-        prom_exporter.start(prom_port)
-        print(f"[prom] Prometheus metrics on :{prom_port}/metrics", flush=True)
-
     meta0, pbp0, poly_pf, game_sb = _resolve_from_args(args)
     game_id = meta0.get("gameID")
     if not game_id:
@@ -597,10 +592,23 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
         flush=True,
     )
 
-    # Start Prometheus /metrics endpoint
-    metrics_port = getattr(args, "metrics_port", 9090)
-    pm.start_metrics_server(metrics_port)
-    print(f"Prometheus metrics on :{metrics_port}/metrics", flush=True)
+    # Start Prometheus /metrics endpoint (default 9200 — Go bot uses 9090)
+    metrics_port = getattr(args, "metrics_port", 9200)
+    if metrics_port:
+        try:
+            pm.start_metrics_server(metrics_port)
+            print(f"Prometheus metrics on :{metrics_port}/metrics", flush=True)
+        except OSError as e:
+            if e.errno == 48:  # EADDRINUSE
+                print(
+                    f"[prom] port {metrics_port} in use — pick another with "
+                    f"--metrics-port (e.g. 9201) or stop the other process.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            raise
+    else:
+        print("[prom] metrics disabled (--metrics-port 0)", flush=True)
 
     iteration = 0
     demo_cursor = 0  # index into demo_all_events
@@ -678,6 +686,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             risk_suffix = ""
             tr = None
             rs = None
+            t_norm = 0.0
             if engine is not None:
                 current_events = demo_all_events[:demo_cursor] if demo_mode else replay_game(pbp)
                 tr = engine.tick(snapshot, payload, result, current_events)
@@ -750,7 +759,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 pm.trading_state.set(pm.STATE_MAP.get(tr.state.value, -1))
                 if tr.action == "execute":
                     pm.hedge_actions_total.labels(action="execute").inc()
-            if risk is not None and portfolio is not None:
+            if rs is not None and portfolio is not None:
                 pm.hedge_t_norm.set(t_norm)
                 pm.hedge_curve_value.set(rs["base_curve"])
                 pm.hedge_target_qty.set(rs["target_qty"])
@@ -768,16 +777,6 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 f"{engine_suffix}{risk_suffix}",
                 flush=True,
             )
-
-            if prom_port:
-                prom_exporter.update(
-                    snapshot=snapshot,
-                    payload=payload,
-                    result=result,
-                    tick_result=tr,
-                    portfolio=portfolio,
-                    risk_status=rs,
-                )
 
             time.sleep(args.interval_sec)
 
@@ -952,8 +951,8 @@ def main():
     parser.add_argument(
         "--metrics-port",
         type=int,
-        default=9090,
-        help="Prometheus /metrics port (default: 9090)",
+        default=9200,
+        help="Prometheus /metrics port for this process (default: 9200; use 9090 only if Go bot is off; 0=disable)",
     )
     args = parser.parse_args()
 

@@ -84,14 +84,16 @@ trading_time_remaining = Gauge(
 )
 
 STATE_MAP = {
-    "FLAT": 0,
-    "SENSING": 1,
+    "IDLE": 0,
+    "WATCHING": 1,
     "ARMED": 2,
     "EXECUTE": 3,
     "COOLDOWN": 4,
 }
 
 
-def start_metrics_server(port: int = 9090) -> None:
-    """Start the Prometheus /metrics HTTP endpoint."""
+def start_metrics_server(port: int = 9200) -> None:
+    """Start the Prometheus /metrics HTTP endpoint. Raises OSError if port is in use."""
+    if port <= 0:
+        return
     start_http_server(port)
