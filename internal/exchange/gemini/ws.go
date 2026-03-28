@@ -33,6 +33,9 @@ type BookTicker struct {
 	AskQty    string `json:"A"`
 }
 
+// BookUpdateFunc is called with each bookTicker update (for hedge monitor).
+type BookUpdateFunc func(symbol string, bestBid, bestAsk float64)
+
 // WSClient connects to Gemini WebSocket for prediction market data.
 type WSClient struct {
 	wsURL        string
@@ -43,6 +46,7 @@ type WSClient struct {
 	// Maps lowercase instrumentSymbol -> {pairID, outcome}
 	symbolToPair map[string]symbolPairInfo
 	updates      chan<- arb.PriceUpdate
+	bookHook     BookUpdateFunc // optional callback for hedge monitor
 	mu           sync.Mutex
 	done         chan struct{}
 }
@@ -96,6 +100,11 @@ func NewWSClient(cfg config.GeminiConfig, markets []ResolvedEvent, updates chan<
 		updates:      updates,
 		done:         make(chan struct{}),
 	}
+}
+
+// SetBookHook registers a callback invoked on every bookTicker update.
+func (w *WSClient) SetBookHook(fn BookUpdateFunc) {
+	w.bookHook = fn
 }
 
 func (w *WSClient) label(symbol string) string {
@@ -189,6 +198,11 @@ func (w *WSClient) readLoop() {
 		fmt.Sscanf(bt.AskQty, "%f", &qtyF)
 		metrics.BookBestAsk.WithLabelValues("gemini", bt.Symbol).Set(askF * 100)
 		metrics.BookBestBid.WithLabelValues("gemini", bt.Symbol).Set(bidF * 100)
+
+		// Feed hedge monitor if hooked
+		if w.bookHook != nil {
+			w.bookHook(bt.Symbol, bidF, askF)
+		}
 
 		// Push to arb detector if this symbol is in a pair
 		if info, ok := w.symbolToPair[strings.ToLower(bt.Symbol)]; ok && w.updates != nil {

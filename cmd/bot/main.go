@@ -16,6 +16,7 @@ import (
 	"github.com/hrishabhayush/polyxgemini/internal/arb"
 	"github.com/hrishabhayush/polyxgemini/internal/budget"
 	"github.com/hrishabhayush/polyxgemini/internal/config"
+	"github.com/hrishabhayush/polyxgemini/internal/engine"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/gemini"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/polymarket"
 	_ "github.com/hrishabhayush/polyxgemini/internal/metrics"
@@ -201,13 +202,39 @@ func main() {
 	}
 
 	// Start Gemini WS
+	var hedgeMonitor *engine.HedgeMonitor
 	if len(allGeminiEvents) > 0 {
 		geminiWS := gemini.NewWSClient(cfg.Gemini, allGeminiEvents, updates, geminiPairMappings)
+
+		// Start hedge monitor if config is present
+		if cfg.Hedge.Mode != "" {
+			hedgeCfg := engine.HedgeConfig{
+				Mode:                 cfg.Hedge.Mode,
+				CurveAlpha:           cfg.Hedge.CurveAlpha,
+				CurveBeta:            cfg.Hedge.CurveBeta,
+				MaxHedgeQty:          cfg.Hedge.MaxHedgeQty,
+				LossThresholdPct:     cfg.Hedge.LossThresholdPct,
+				MildLossThresholdPct: cfg.Hedge.MildLossThresholdPct,
+				MaxTotalExposure:     cfg.Hedge.MaxTotalExposure,
+				GeminiHalfSpread:     cfg.Hedge.GeminiHalfSpread,
+				RebalanceThreshold:   cfg.Hedge.RebalanceThreshold,
+				PollIntervalMS:       cfg.Hedge.PollIntervalMS,
+			}
+			hedgeMonitor = engine.NewHedgeMonitor(hedgeCfg)
+			geminiWS.SetBookHook(hedgeMonitor.UpdateBook)
+		}
+
 		if err := geminiWS.Connect(); err != nil {
 			log.Printf("WARN: gemini ws failed: %v", err)
 		} else {
 			defer geminiWS.Close()
 			log.Printf("[gemi] subscribed to %d events", len(allGeminiEvents))
+		}
+
+		if hedgeMonitor != nil {
+			go hedgeMonitor.Run()
+			defer hedgeMonitor.Stop()
+			log.Println("[hedge] monitor started")
 		}
 	}
 
