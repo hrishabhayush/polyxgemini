@@ -97,6 +97,7 @@ type HedgeMonitor struct {
 	gemBooks  map[string]GeminiBook // symbol (lowercase) -> latest book
 	done      chan struct{}
 	logDirOK  bool
+	tickCount int
 }
 
 // NewHedgeMonitor creates the monitor (not yet started).
@@ -191,6 +192,9 @@ func (m *HedgeMonitor) tNorm() float64 {
 }
 
 func (m *HedgeMonitor) tick() {
+	m.tickCount++
+	statusTick := m.tickCount%12 == 0 // log status every ~60s at 5s poll
+
 	// Try reading Python signal file for Poly position + t_norm
 	m.signalFresh = false
 	var lastGameID string
@@ -210,6 +214,8 @@ func (m *HedgeMonitor) tick() {
 			m.newsActive = true
 		}
 		m.mu.Unlock()
+	} else if statusTick {
+		log.Printf("[hedge] waiting for signal file (%s)", m.signalPath)
 	}
 
 	m.mu.Lock()
@@ -223,11 +229,16 @@ func (m *HedgeMonitor) tick() {
 	polySide := m.polyPosition
 	polyQty := m.polyQty
 	polyEntry := m.polyEntry
+	nPolyBooks := len(m.polyBooks)
+	nGemBooks := len(m.gemBooks)
 
 	m.mu.Unlock()
 
 	// Need Gemini book at minimum
 	if gemBid <= 0 && gemAsk <= 0 {
+		if statusTick {
+			log.Printf("[hedge] waiting for Gemini book data (poly_books=%d gemini_books=%d)", nPolyBooks, nGemBooks)
+		}
 		return
 	}
 
@@ -359,6 +370,18 @@ func (m *HedgeMonitor) tick() {
 		log.Printf("[hedge] %s side=%s delta=%.1f target=%.1f reason=%s | %s | combined=$%.4f",
 			directive.Action, directive.Side, directive.DeltaQty, directive.TargetQty,
 			directive.Reason, m.portfolio.Summary(), combined)
+	} else if statusTick {
+		newsStr := "no"
+		if m.newsActive {
+			newsStr = "yes"
+		}
+		sigStr := "stale"
+		if m.signalFresh {
+			sigStr = "fresh"
+		}
+		log.Printf("[hedge] status: t=%.3f curve=%.3f target=%.1f | poly=%s qty=%.1f pnl=$%.4f | %s | news=%s signal=%s reason=%s",
+			tNorm, curve, target, polySide, polyQty, polyPnL,
+			m.portfolio.Summary(), newsStr, sigStr, directive.Reason)
 	}
 
 	m.appendLog(entry)
