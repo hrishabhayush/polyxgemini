@@ -35,17 +35,15 @@ func DefaultHedgeConfig() HedgeConfig {
 	}
 }
 
-// HedgeState is the JSON payload written by Python each tick.
+// HedgeState holds current Poly position + market state for hedge evaluation.
 type HedgeState struct {
-	PolyPosition string  `json:"position"`    // "HOME" | "AWAY" | "FLAT"
-	PolyQty      float64 `json:"qty"`         // current Poly contract count
-	PolyEntry    float64 `json:"entry"`       // Poly entry price
-	PolyMid      float64 `json:"mid"`         // current Poly mid price
-	PnL          float64 `json:"pnl"`         // Poly unrealised PnL (dollars)
-	GameID       string  `json:"game_id"`     // NCAA game ID
-	TNorm        float64 `json:"t_norm"`      // normalised game time [0,1]
-	NewsActive   bool    `json:"news_active"` // has any news event been triggered?
-	Timestamp    string  `json:"timestamp"`   // ISO 8601
+	PolyPosition string  // "HOME" | "AWAY" | ""
+	PolyQty      float64 // current Poly contract count
+	PolyEntry    float64 // Poly entry price
+	PolyMid      float64 // current Poly mid price
+	PnL          float64 // Poly unrealised PnL (dollars)
+	TNorm        float64 // normalised game time [0,1]
+	NewsActive   bool    // has any news/volatility event been triggered?
 }
 
 // HedgeDirective is the output of Evaluate — tells the monitor what to do.

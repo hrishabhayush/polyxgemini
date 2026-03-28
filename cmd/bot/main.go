@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -190,9 +191,33 @@ func main() {
 	// Start arb detector
 	go detector.Run()
 
+	// Hedge monitor (needs both Poly + Gemini WS hooks)
+	var hedgeMonitor *engine.HedgeMonitor
+	if cfg.Hedge.Mode != "" && len(allGeminiEvents) > 0 {
+		hedgeCfg := engine.HedgeConfig{
+			Mode:                 cfg.Hedge.Mode,
+			CurveAlpha:           cfg.Hedge.CurveAlpha,
+			CurveBeta:            cfg.Hedge.CurveBeta,
+			MaxHedgeQty:          cfg.Hedge.MaxHedgeQty,
+			LossThresholdPct:     cfg.Hedge.LossThresholdPct,
+			MildLossThresholdPct: cfg.Hedge.MildLossThresholdPct,
+			MaxTotalExposure:     cfg.Hedge.MaxTotalExposure,
+			GeminiHalfSpread:     cfg.Hedge.GeminiHalfSpread,
+			RebalanceThreshold:   cfg.Hedge.RebalanceThreshold,
+			PollIntervalMS:       cfg.Hedge.PollIntervalMS,
+		}
+		// Game timing: default 40-minute NCAA game starting now
+		gameStart := time.Now()
+		gameDuration := 40 * time.Minute
+		hedgeMonitor = engine.NewHedgeMonitor(hedgeCfg, gameStart, gameDuration)
+	}
+
 	// Start Polymarket WS
 	if len(allPolyMarkets) > 0 {
 		polyWS := polymarket.NewWSClient(allPolyMarkets, updates, polyPairMappings)
+		if hedgeMonitor != nil {
+			polyWS.SetBookHook(hedgeMonitor.UpdatePolyBook)
+		}
 		if err := polyWS.Connect(); err != nil {
 			log.Printf("WARN: polymarket ws failed: %v", err)
 		} else {
@@ -202,40 +227,23 @@ func main() {
 	}
 
 	// Start Gemini WS
-	var hedgeMonitor *engine.HedgeMonitor
 	if len(allGeminiEvents) > 0 {
 		geminiWS := gemini.NewWSClient(cfg.Gemini, allGeminiEvents, updates, geminiPairMappings)
-
-		// Start hedge monitor if config is present
-		if cfg.Hedge.Mode != "" {
-			hedgeCfg := engine.HedgeConfig{
-				Mode:                 cfg.Hedge.Mode,
-				CurveAlpha:           cfg.Hedge.CurveAlpha,
-				CurveBeta:            cfg.Hedge.CurveBeta,
-				MaxHedgeQty:          cfg.Hedge.MaxHedgeQty,
-				LossThresholdPct:     cfg.Hedge.LossThresholdPct,
-				MildLossThresholdPct: cfg.Hedge.MildLossThresholdPct,
-				MaxTotalExposure:     cfg.Hedge.MaxTotalExposure,
-				GeminiHalfSpread:     cfg.Hedge.GeminiHalfSpread,
-				RebalanceThreshold:   cfg.Hedge.RebalanceThreshold,
-				PollIntervalMS:       cfg.Hedge.PollIntervalMS,
-			}
-			hedgeMonitor = engine.NewHedgeMonitor(hedgeCfg)
-			geminiWS.SetBookHook(hedgeMonitor.UpdateBook)
+		if hedgeMonitor != nil {
+			geminiWS.SetBookHook(hedgeMonitor.UpdateGeminiBook)
 		}
-
 		if err := geminiWS.Connect(); err != nil {
 			log.Printf("WARN: gemini ws failed: %v", err)
 		} else {
 			defer geminiWS.Close()
 			log.Printf("[gemi] subscribed to %d events", len(allGeminiEvents))
 		}
+	}
 
-		if hedgeMonitor != nil {
-			go hedgeMonitor.Run()
-			defer hedgeMonitor.Stop()
-			log.Println("[hedge] monitor started")
-		}
+	// Start hedge monitor after both WS are connected
+	if hedgeMonitor != nil {
+		go hedgeMonitor.Run()
+		defer hedgeMonitor.Stop()
 	}
 
 	if len(allPolyMarkets) == 0 && len(allGeminiEvents) == 0 {

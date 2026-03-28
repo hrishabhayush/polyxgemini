@@ -11,6 +11,9 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// BookUpdateFunc is called with each orderbook update (for hedge monitor).
+type BookUpdateFunc func(assetID string, bestBid, bestAsk float64)
+
 // WSClient wraps the Polymarket real-time data client for CLOB market subscriptions.
 type WSClient struct {
 	client      *polymarketrealtime.Client
@@ -20,6 +23,7 @@ type WSClient struct {
 	// Maps token ID -> {pairID, outcome} for arb detection
 	tokenToPair map[string]tokenPairInfo
 	updates     chan<- arb.PriceUpdate
+	bookHook    BookUpdateFunc // optional callback for hedge monitor
 }
 
 type tokenPairInfo struct {
@@ -82,6 +86,11 @@ func NewWSClient(markets []ResolvedMarket, updates chan<- arb.PriceUpdate, pairM
 	}
 }
 
+// SetBookHook registers a callback invoked on every orderbook update.
+func (w *WSClient) SetBookHook(fn BookUpdateFunc) {
+	w.bookHook = fn
+}
+
 func (w *WSClient) label(assetID string) string {
 	if l, ok := w.assetLabels[assetID]; ok {
 		return l
@@ -135,6 +144,11 @@ func (w *WSClient) Connect() error {
 			metrics.BookBestBid.WithLabelValues("polymarket", ob.AssetID).Set(bidF * 100)
 			metrics.BookDepthLevels.WithLabelValues("polymarket", ob.AssetID, "ask").Set(float64(len(ob.Asks)))
 			metrics.BookDepthLevels.WithLabelValues("polymarket", ob.AssetID, "bid").Set(float64(len(ob.Bids)))
+
+			// Feed hedge monitor if hooked
+			if w.bookHook != nil {
+				w.bookHook(ob.AssetID, bidF, askF)
+			}
 
 			// Push to arb detector if this token is in a pair
 			if info, ok := w.tokenToPair[ob.AssetID]; ok && w.updates != nil {
