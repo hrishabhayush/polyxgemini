@@ -8,6 +8,7 @@ import (
 
 	"github.com/hrishabhayush/polyxgemini/internal/config"
 	"github.com/hrishabhayush/polyxgemini/internal/exchange/polymarket"
+	"github.com/hrishabhayush/polyxgemini/internal/metrics"
 	"github.com/hrishabhayush/polyxgemini/internal/ml"
 	"github.com/hrishabhayush/polyxgemini/internal/report"
 )
@@ -93,6 +94,8 @@ func (s *MLScanner) Run(ctx context.Context, markets []polymarket.ResolvedMarket
 }
 
 func (s *MLScanner) evaluateMarket(ctx context.Context, m polymarket.ResolvedMarket) (*MLSignal, error) {
+	start := time.Now()
+
 	rpt, err := s.reportGen.Generate(ctx, m.Slug)
 	if err != nil {
 		return nil, err
@@ -130,6 +133,9 @@ func (s *MLScanner) evaluateMarket(ctx context.Context, m polymarket.ResolvedMar
 		return nil, err
 	}
 
+	elapsed := time.Since(start)
+	metrics.ConfidenceInferenceSeconds.Observe(elapsed.Seconds())
+
 	sig := &MLSignal{
 		Market:  m,
 		ProbYes: pred.ProbYes,
@@ -146,6 +152,8 @@ func (s *MLScanner) evaluateMarket(ctx context.Context, m polymarket.ResolvedMar
 		sig.BuySide = "NO"
 		sig.BuyEdge = pred.EdgeNo
 	}
+
+	metrics.ConfidenceScore.WithLabelValues(m.Slug, "prediction").Set(sig.BuyEdge)
 
 	return sig, nil
 }

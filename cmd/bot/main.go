@@ -4,11 +4,14 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/hrishabhayush/polyxgemini/internal/arb"
 	"github.com/hrishabhayush/polyxgemini/internal/budget"
@@ -30,6 +33,15 @@ func main() {
 	}
 	log.Printf("config loaded from %s", *configPath)
 
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		log.Printf("[metrics] serving Prometheus on :9090/metrics")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			log.Fatalf("metrics server: %v", err)
+		}
+	}()
+
 	wl, err := config.LoadWatchlist(cfg.Polymarket.WatchlistPath)
 	if err != nil {
 		log.Fatalf("failed to load watchlist: %v", err)
@@ -38,18 +50,19 @@ func main() {
 		len(wl.Markets), len(wl.GeminiMarkets))
 
 	ctx := context.Background()
+	botCtx, botCancel := context.WithCancel(ctx)
+	defer botCancel()
+
+	maxUSD := cfg.Engine.MaxPositionUSD
+	if maxUSD <= 0 {
+		maxUSD = 1e12
+	}
+	bud := budget.New(maxUSD, botCancel)
 
 	polyClient := polymarket.NewClient(cfg.Polymarket)
 	geminiClient := gemini.NewClient(cfg.Gemini)
 
-	budgetLimit := cfg.Engine.MaxPositionUSD
-	if budgetLimit <= 0 {
-		budgetLimit = 10_000
-	}
-	_, arbCancel := context.WithCancel(ctx)
-	defer arbCancel()
-	b := budget.New(budgetLimit, arbCancel)
-	detector := arb.NewDetector(256, b, cfg.Engine.DryRun, polyClient, geminiClient)
+	detector := arb.NewDetector(1024, bud, cfg.Engine.DryRun, polyClient, geminiClient)
 	updates := detector.Updates()
 
 	var polyResolved []polymarket.ResolvedMarket
@@ -63,7 +76,11 @@ func main() {
 		polyResolved = append(polyResolved, *m)
 	}
 
+	var allPolyMarkets []polymarket.ResolvedMarket
 	var allGeminiEvents []gemini.ResolvedEvent
+	var polyPairMappings []polymarket.PairMapping
+	var geminiPairMappings []gemini.PairMapping
+
 	for _, entry := range wl.GeminiMarkets {
 		e, err := geminiClient.ResolveEvent(ctx, entry.Ticker)
 		if err != nil {
@@ -73,10 +90,6 @@ func main() {
 		log.Printf("[gemi] resolved %q -> %d contracts", e.Title, len(e.Contracts))
 		allGeminiEvents = append(allGeminiEvents, *e)
 	}
-
-	var allPolyMarkets []polymarket.ResolvedMarket
-	var polyPairMappings []polymarket.PairMapping
-	var geminiPairMappings []gemini.PairMapping
 
 	for _, pair := range wl.Pairs {
 		log.Printf("[pair] resolving %q...", pair.Name)
@@ -198,11 +211,7 @@ func main() {
 		})
 	}
 
-	polyWSMarkets := allPolyMarkets
-	if len(polyWSMarkets) == 0 {
-		polyWSMarkets = polyResolved
-	}
-
+	polyWSMarkets := mergeResolvedMarkets(polyResolved, allPolyMarkets)
 	if len(polyWSMarkets) > 0 {
 		polyWS := polymarket.NewWSClient(polyWSMarkets, updates, polyPairMappings)
 		if hedgeMonitor != nil {
@@ -216,8 +225,9 @@ func main() {
 		}
 	}
 
-	if len(allGeminiEvents) > 0 {
-		geminiWS := gemini.NewWSClient(cfg.Gemini, allGeminiEvents, updates, geminiPairMappings)
+	geminiWSMarkets := dedupeGeminiEvents(allGeminiEvents)
+	if len(geminiWSMarkets) > 0 {
+		geminiWS := gemini.NewWSClient(cfg.Gemini, geminiWSMarkets, updates, geminiPairMappings)
 		if hedgeMonitor != nil {
 			geminiWS.SetBookHook(hedgeMonitor.UpdateGeminiBook)
 		}
@@ -225,7 +235,7 @@ func main() {
 			log.Printf("WARN: gemini ws failed: %v", err)
 		} else {
 			defer geminiWS.Close()
-			log.Printf("[gemi] subscribed to %d events", len(allGeminiEvents))
+			log.Printf("[gemi] subscribed to %d events", len(geminiWSMarkets))
 		}
 	}
 
@@ -234,13 +244,11 @@ func main() {
 		defer hedgeMonitor.Stop()
 	}
 
-	hasPoly := len(polyResolved) > 0 || len(allPolyMarkets) > 0
-	hasGem := len(allGeminiEvents) > 0
-	if !hasPoly && !hasGem {
+	if len(polyWSMarkets) == 0 && len(geminiWSMarkets) == 0 {
 		log.Fatal("no markets resolved on either exchange")
 	}
 
-	scanCtx, scanCancel := context.WithCancel(ctx)
+	scanCtx, scanCancel := context.WithCancel(botCtx)
 	defer scanCancel()
 
 	if cfg.Engine.MLServerURL != "" && len(polyResolved) > 0 {
@@ -266,4 +274,36 @@ func main() {
 	<-sig
 	scanCancel()
 	log.Println("shutting down...")
+}
+
+func mergeResolvedMarkets(a, b []polymarket.ResolvedMarket) []polymarket.ResolvedMarket {
+	seen := make(map[string]struct{})
+	out := make([]polymarket.ResolvedMarket, 0, len(a)+len(b))
+	for _, m := range append(append([]polymarket.ResolvedMarket{}, a...), b...) {
+		if m.ConditionID == "" {
+			continue
+		}
+		if _, ok := seen[m.ConditionID]; ok {
+			continue
+		}
+		seen[m.ConditionID] = struct{}{}
+		out = append(out, m)
+	}
+	return out
+}
+
+func dedupeGeminiEvents(in []gemini.ResolvedEvent) []gemini.ResolvedEvent {
+	seen := make(map[string]struct{})
+	out := make([]gemini.ResolvedEvent, 0, len(in))
+	for _, e := range in {
+		if e.Ticker == "" {
+			continue
+		}
+		if _, ok := seen[e.Ticker]; ok {
+			continue
+		}
+		seen[e.Ticker] = struct{}{}
+		out = append(out, e)
+	}
+	return out
 }

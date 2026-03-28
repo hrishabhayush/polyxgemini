@@ -8,6 +8,8 @@ Examples:
   python python/ml/predict_live_game.py --from-json data/games/6534602.json
   python python/ml/predict_live_game.py --game-id 6534602 --live --interval-sec 5
   python python/ml/predict_live_game.py --game-id 6534602 --live --trade-engine
+  python python/ml/predict_live_game.py --game-id 6534713 --demo data/games/6534602.json
+  python python/ml/predict_live_game.py --game-id 6534713 --live --demo data/games/6534602.json --trade-engine --risk-engine
 """
 
 from __future__ import annotations
@@ -29,12 +31,15 @@ from fetch_games import (
 )
 from in_game_features import (
     compute_snapshot_from_events,
+    infer_game_start_epoch,
+    parse_poly_series,
+    poly_features_at_time,
     replay_game,
 )
 from trading_engine import DeadZoneConfig, TradingEngine
 from paper_portfolio import PaperPortfolio, synthetic_paper_orderbook
 from risk_engine import CurveConfig, RiskEngine
-from trading_engine import TradingEngine
+import prom_metrics as pm
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -62,6 +67,55 @@ DEFAULT_POLY_FEATS = {
     "poly_trade_count_5m": 0,
     "has_poly": 0,
 }
+
+
+def _enrich_price_list(
+    price_list: list[tuple[float, float]],
+    trade_list: list[dict],
+) -> list[tuple[float, float]]:
+    """Build a dense price timeline by merging sparse price snapshots with trade prices.
+
+    Only includes trades whose price is closer to the existing price series
+    than to its complement (1 - price). This correctly filters out trades
+    on the opposite token.
+    """
+    combined: dict[float, float] = {}
+    for ts, price in price_list:
+        combined[ts] = price
+    # Determine valid price band from the existing pre-game series (exclude terminal 0/1)
+    existing_prices = [p for _, p in price_list if 0.02 < p < 0.98]
+    if not existing_prices:
+        return sorted(combined.items(), key=lambda x: x[0])
+    lo = min(existing_prices)
+    hi = max(existing_prices)
+    # Allow 2x the range as margin (prices can move beyond pre-game, but not to dust)
+    band = max(hi - lo, 0.10)
+    floor = max(0.01, lo - band)
+    ceil = min(0.99, hi + band)
+    for t in trade_list:
+        ts, price = t["ts"], t["price"]
+        if ts <= 0 or price <= 0:
+            continue
+        if floor <= price <= ceil:
+            combined[ts] = price
+    return sorted(combined.items(), key=lambda x: x[0])
+
+
+def _demo_poly_features(
+    time_remaining_sec: float,
+    max_time: float,
+    game_start_epoch: float,
+    price_list: list[tuple[float, float]],
+    trade_list: list[dict],
+) -> dict:
+    """Serve historical Polymarket features aligned to current game clock."""
+    return poly_features_at_time(
+        t_remain=time_remaining_sec,
+        max_time=max_time,
+        game_start_epoch=game_start_epoch,
+        price_list=price_list,
+        trade_list=trade_list,
+    )
 
 
 def _norm(text: str) -> str:
@@ -366,13 +420,9 @@ def _post_predict(server: str, payload: dict) -> dict:
         return json.loads(r.read())
 
 
-def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict, dict]:
-    """Shared feature assembly for one-shot and live loops."""
-    events = replay_game(pbp)
-    if not events:
-        raise ValueError("No usable play-by-play events with score/clock data")
-    snapshot = compute_snapshot_from_events(events, meta)
-    payload = {
+def _build_payload_from_snapshot(snapshot: dict, poly_feats: dict) -> dict:
+    """Build ML payload from a pre-computed snapshot + poly features."""
+    return {
         "time_remaining_sec": float(snapshot["time_remaining_sec"]),
         "period": int(snapshot["period"]),
         "score_diff": int(snapshot["score_diff"]),
@@ -389,6 +439,15 @@ def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict
         "poly_trade_count_5m": int(poly_feats["poly_trade_count_5m"]),
         "has_poly": int(poly_feats["has_poly"]),
     }
+
+
+def build_predict_payload(meta: dict, pbp: dict, poly_feats: dict) -> tuple[dict, dict]:
+    """Shared feature assembly for one-shot and live loops."""
+    events = replay_game(pbp)
+    if not events:
+        raise ValueError("No usable play-by-play events with score/clock data")
+    snapshot = compute_snapshot_from_events(events, meta)
+    payload = _build_payload_from_snapshot(snapshot, poly_feats)
     return snapshot, payload
 
 
@@ -477,12 +536,41 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
     meta0 = _merge_scoreboard_meta(meta0, game_sb)
 
+    # Demo mode: load historical Polymarket data + pre-compute all PBP events for replay
+    demo_price_list: list[tuple[float, float]] | None = None
+    demo_trade_list: list[dict] | None = None
+    demo_start_epoch: float = 0.0
+    demo_max_time: float = 2400.0
+    demo_all_events: list | None = None
+    demo_mode = bool(getattr(args, "demo", None))
+    if demo_mode:
+        with open(args.demo) as f:
+            demo_record = json.load(f)
+        demo_poly = demo_record.get("polymarket", {})
+        demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
+        # Enrich sparse price snapshots with trade execution prices
+        demo_price_list = _enrich_price_list(demo_price_list, demo_trade_list)
+        demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
+        demo_title = demo_record.get("meta", {}).get("title", args.demo)
+        # Pre-load all PBP events so we can step through them
+        pbp_init = _fetch_pbp_with_retries(str(game_id))
+        if not pbp_init:
+            raise RuntimeError("Could not fetch play-by-play for demo replay")
+        demo_all_events = replay_game(pbp_init)
+        if not demo_all_events:
+            raise RuntimeError("No usable PBP events for demo replay")
+        print(
+            f"[DEMO] Replaying market data from {demo_title} "
+            f"({len(demo_all_events)} PBP events)",
+            flush=True,
+        )
+
     slugs_cache: list[str] | None = None
-    if not args.poly_slug and not args.no_poly:
+    if not demo_mode and not args.poly_slug and not args.no_poly:
         slugs_cache = scrape_poly_slugs()
 
     slug = None
-    if not args.no_poly:
+    if not demo_mode and not args.no_poly:
         slug = _resolve_polymarket_slug(meta0, args.poly_slug, slugs_cache)
 
     use_engine = getattr(args, "trade_engine", False)
@@ -531,14 +619,35 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
         engine_label += f" | min_trade_interval={args.trade_interval_sec:g}s"
     if use_risk:
         engine_label += f" | risk_engine=ON (max={risk_cfg.max_contracts} α={risk_cfg.alpha} β={risk_cfg.beta})"
+    poly_source = "demo" if demo_mode else (slug or "none")
     print(
         f"Live loop: game {game_id} | poll={args.interval_sec}s | "
-        f"stop_on_final={stop_on_final} | poly_slug={slug or 'none'}{engine_label}",
+        f"stop_on_final={stop_on_final} | poly_source={poly_source}{engine_label}",
         flush=True,
     )
 
+    # Start Prometheus /metrics endpoint (default 9200 — Go bot uses 9090)
+    metrics_port = getattr(args, "metrics_port", 9200)
+    if metrics_port:
+        try:
+            pm.start_metrics_server(metrics_port)
+            print(f"Prometheus metrics on :{metrics_port}/metrics", flush=True)
+        except OSError as e:
+            if e.errno == 48:  # EADDRINUSE
+                print(
+                    f"[prom] port {metrics_port} in use — pick another with "
+                    f"--metrics-port (e.g. 9201) or stop the other process.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            raise
+    else:
+        print("[prom] metrics disabled (--metrics-port 0)", flush=True)
+
     iteration = 0
+    demo_cursor = 0  # index into demo_all_events
     last_fp: tuple | None = None
+    prev_t_rem: float | None = None  # for computing game clock delta in demo mode
 
     try:
         while True:
@@ -547,32 +656,46 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 print("Stopping: max-iterations reached.", flush=True)
                 break
 
-            pbp = _fetch_pbp_with_retries(str(game_id))
-            if not pbp:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: PBP fetch failed; retrying...", flush=True)
-                time.sleep(args.interval_sec)
-                continue
+            if demo_mode:
+                # Step through pre-loaded events instead of fetching live PBP
+                demo_cursor += 1
+                if demo_cursor > len(demo_all_events):
+                    print("[DEMO] All PBP events replayed; stopping.", flush=True)
+                    break
+                current_events = demo_all_events[:demo_cursor]
+                snapshot = compute_snapshot_from_events(current_events, meta0)
+                poly_feats = _demo_poly_features(
+                    float(snapshot["time_remaining_sec"]),
+                    demo_max_time,
+                    demo_start_epoch,
+                    demo_price_list,
+                    demo_trade_list,
+                )
+                payload = _build_payload_from_snapshot(snapshot, poly_feats)
+            else:
+                pbp = _fetch_pbp_with_retries(str(game_id))
+                if not pbp:
+                    print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: PBP fetch failed; retrying...", flush=True)
+                    time.sleep(args.interval_sec)
+                    continue
 
-            meta = _meta_from_pbp(str(game_id), pbp, date_str=args.date)
-            meta = _merge_scoreboard_meta(meta, game_sb)
+                meta0 = _meta_from_pbp(str(game_id), pbp, date_str=args.date)
+                meta0 = _merge_scoreboard_meta(meta0, game_sb)
 
-            if stop_on_final and _pbp_indicates_final(pbp):
-                print("Game status is final; stopping live loop.", flush=True)
-                break
+                if stop_on_final and _pbp_indicates_final(pbp):
+                    print("Game status is final; stopping live loop.", flush=True)
+                    break
 
-            poly_feats = {**DEFAULT_POLY_FEATS}
-            if not args.no_poly:
-                if slug:
-                    poly_feats = _fetch_live_polymarket_features(meta, slug)
-                else:
-                    poly_feats = {**DEFAULT_POLY_FEATS}
+                poly_feats = {**DEFAULT_POLY_FEATS}
+                if not args.no_poly and slug:
+                    poly_feats = _fetch_live_polymarket_features(meta0, slug)
 
-            try:
-                snapshot, payload = build_predict_payload(meta, pbp, poly_feats)
-            except ValueError as e:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: {e}", flush=True)
-                time.sleep(args.interval_sec)
-                continue
+                try:
+                    snapshot, payload = build_predict_payload(meta0, pbp, poly_feats)
+                except ValueError as e:
+                    print(f"[{datetime.now().isoformat(timespec='seconds')}] WARN: {e}", flush=True)
+                    time.sleep(args.interval_sec)
+                    continue
 
             fp = _fingerprint(snapshot, payload)
             if args.skip_duplicate_lines and fp == last_fp:
@@ -596,9 +719,19 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
             engine_suffix = ""
             risk_suffix = ""
+            tr = None
+            rs = None
+            t_norm = 0.0
+            # Compute game clock delta for demo mode
+            cur_t_rem = float(snapshot["time_remaining_sec"])
+            clock_delta = None
+            if demo_mode and prev_t_rem is not None:
+                clock_delta = max(0.0, prev_t_rem - cur_t_rem)
+            prev_t_rem = cur_t_rem
+
             if engine is not None:
-                events = replay_game(pbp)
-                tr = engine.tick(snapshot, payload, result, events)
+                current_events = demo_all_events[:demo_cursor] if demo_mode else replay_game(pbp)
+                tr = engine.tick(snapshot, payload, result, current_events, clock_delta=clock_delta)
                 engine_suffix = (
                     f" | {tr.state.value} ema={tr.ema_edge:+.4f} "
                     f"nL={tr.normalised_lead:+.2f} eps={tr.epsilon_eff:.3f} "
@@ -639,11 +772,18 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                             portfolio.reduce_position(abs(directive.delta_qty), books)
                             risk.on_fill(directive.delta_qty, tick_side)
                     else:
-                        # Curve-driven rebalance (trimming) every tick
-                        directive = risk.check_rebalance(t_norm, now_mono)
+                        # Curve-driven rebalance every tick (both scale-up and trim)
+                        directive = risk.check_rebalance(t_norm, now_mono, allow_scale_up=True)
                         if directive.action == "reduce" and directive.delta_qty < 0:
                             portfolio.reduce_position(abs(directive.delta_qty), books)
                             risk.on_fill(directive.delta_qty, risk._actual_side or tick_side)
+                        elif directive.action == "buy" and directive.delta_qty > 0:
+                            portfolio.on_execute(
+                                tick_side, books,
+                                ema_edge=tr.ema_edge, ts_iso=ts,
+                                qty=directive.delta_qty,
+                            )
+                            risk.on_fill(directive.delta_qty, tick_side)
 
                     portfolio.mark_to_market(books)
                     rs = risk.status(t_norm, now_mono)
@@ -657,6 +797,37 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
                 if tr.action == "execute":
                     engine_suffix += " >>> TRADE SIGNAL <<<"
+
+            # ---- Prometheus metrics ----
+            pm.trading_time_remaining.set(float(snapshot["time_remaining_sec"]))
+            pm.trading_score_diff.set(int(snapshot["score_diff"]))
+            pm.trading_poly_price.set(float(payload["poly_price"]))
+            pm.confidence_score.labels(market=str(game_id), category="ncaa").set(ph)
+            if engine is not None:
+                pm.trading_ema_edge.set(tr.ema_edge)
+                pm.trading_state.set(pm.STATE_MAP.get(tr.state.value, -1))
+                if tr.action == "execute":
+                    pm.hedge_actions_total.labels(action="execute").inc()
+            if rs is not None and portfolio is not None:
+                pm.hedge_t_norm.set(t_norm)
+                pm.hedge_curve_value.set(rs["base_curve"])
+                pm.hedge_target_qty.set(rs["target_qty"])
+                pm.hedge_actual_qty.set(rs["actual_qty"])
+                pm.hedge_news_active.set(1.0 if rs["news_boost"] > 1.01 else 0.0)
+                pm.hedge_realised_pnl.set(portfolio.realised_pnl)
+                pm.hedge_unrealised_pnl.set(portfolio.unrealised_pnl)
+                pm.hedge_combined_pnl.set(portfolio.realised_pnl + portfolio.unrealised_pnl)
+                # Trade-level metrics
+                pm.trade_position_qty.set(portfolio.qty)
+                pm.trade_entry_price.set(portfolio.entry_price if portfolio.qty > 0 else 0)
+                side_val = 0
+                if portfolio.position == "HOME":
+                    side_val = 1
+                elif portfolio.position == "AWAY":
+                    side_val = -1
+                pm.trade_position_side.set(side_val)
+                if tr.action == "execute":
+                    pm.trade_total_count.inc()
 
             print(
                 f"{ts} | t_rem={snapshot['time_remaining_sec']:.0f}s P{snapshot['period']} | "
@@ -678,11 +849,32 @@ def run_one_shot(args) -> None:
     meta = _merge_scoreboard_meta(meta, game_sb)
 
     poly_feats = {**DEFAULT_POLY_FEATS}
-    if poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
+    demo_mode = bool(getattr(args, "demo", None))
+    if demo_mode:
+        with open(args.demo) as f:
+            demo_record = json.load(f)
+        demo_poly = demo_record.get("polymarket", {})
+        demo_price_list, demo_trade_list = parse_poly_series(demo_poly)
+        demo_price_list = _enrich_price_list(demo_price_list, demo_trade_list)
+        demo_max_time = 2400.0
+        demo_start_epoch = infer_game_start_epoch(demo_max_time, demo_price_list, demo_trade_list)
+        demo_title = demo_record.get("meta", {}).get("title", args.demo)
+        print(f"[DEMO] Replaying market data from {demo_title}", flush=True)
+        events = replay_game(pbp)
+        if events:
+            snap = compute_snapshot_from_events(events, meta)
+            poly_feats = _demo_poly_features(
+                float(snap["time_remaining_sec"]),
+                demo_max_time,
+                demo_start_epoch,
+                demo_price_list,
+                demo_trade_list,
+            )
+    elif poly_prefetched and isinstance(poly_prefetched, dict) and poly_prefetched.get("found"):
         poly_feats = _poly_from_prefetched(poly_prefetched)
 
     slugs_cache: list[str] | None = None
-    if not args.no_poly and not (poly_prefetched and poly_prefetched.get("found")):
+    if not demo_mode and not args.no_poly and not (poly_prefetched and poly_prefetched.get("found")):
         if not args.poly_slug:
             slugs_cache = scrape_poly_slugs()
         slug = _resolve_polymarket_slug(meta, args.poly_slug, slugs_cache)
@@ -713,6 +905,11 @@ def main():
     parser.add_argument("--from-json", help="Use pre-fetched game JSON file")
     parser.add_argument("--poly-slug", help="Optional Polymarket event slug override")
     parser.add_argument("--no-poly", action="store_true", help="Skip Polymarket fetch")
+    parser.add_argument(
+        "--demo",
+        metavar="PATH",
+        help="Replay historical Polymarket data from a game JSON (implies --no-poly for live API)",
+    )
     parser.add_argument("--require-bracket", action="store_true", default=False)
     parser.add_argument("--server", default="http://127.0.0.1:8766", help="Prediction server URL")
     parser.add_argument(
@@ -811,6 +1008,12 @@ def main():
         type=float,
         default=2.0,
         help="Beta distribution beta — ramp-down speed (default: 2.0)",
+    )
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=9200,
+        help="Prometheus /metrics port for this process (default: 9200; use 9090 only if Go bot is off; 0=disable)",
     )
     args = parser.parse_args()
 
