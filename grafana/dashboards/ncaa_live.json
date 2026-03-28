@@ -1,0 +1,520 @@
+{
+  "uid": "ncaa-live-trading",
+  "title": "NCAA Live Trading",
+  "tags": ["ncaa", "ml", "trading", "live"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "links": [
+    { "title": "Operations", "url": "/d/polyxgemini-operations", "type": "link", "icon": "bolt", "tooltip": "System health & WebSocket monitoring" },
+    { "title": "Trading", "url": "/d/polyxgemini-trading", "type": "link", "icon": "graph-bar", "tooltip": "PnL, capital, arbitrage & positions" },
+    { "title": "Confidence Model", "url": "/d/polyxgemini-confidence", "type": "link", "icon": "brain", "tooltip": "ML confidence scores & news sources" }
+  ],
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Game Clock",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 1,
+      "title": "Time Remaining",
+      "description": "Seconds remaining in regulation.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "ncaa_game_time_remaining_sec",
+          "legendFormat": "t_rem"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 300 },
+              { "color": "green", "value": 900 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 2,
+      "title": "Period",
+      "description": "Current game period (quarter or half).",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 3, "x": 4, "y": 1 },
+      "targets": [
+        {
+          "expr": "ncaa_game_period",
+          "legendFormat": "period"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "none", "textMode": "value", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 3,
+      "title": "Polymarket YES Price",
+      "description": "Current Polymarket home YES contract price.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 7, "y": 1 },
+      "targets": [
+        {
+          "expr": "ncaa_market_poly_price",
+          "legendFormat": "poly"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+
+    {
+      "id": 200,
+      "type": "row",
+      "title": "ML Model",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "P(Home Win)",
+      "description": "ML model probability of home team winning.",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 4, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "ncaa_model_prob_home",
+          "legendFormat": "P(home)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "P(Away Win)",
+      "description": "ML model probability of away team winning.",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 4, "x": 4, "y": 7 },
+      "targets": [
+        {
+          "expr": "ncaa_model_prob_away",
+          "legendFormat": "P(away)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Edge vs Market",
+      "description": "Model edge vs Polymarket price over time. Positive = model sees value.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 16, "x": 8, "y": 7 },
+      "targets": [
+        {
+          "expr": "ncaa_model_edge",
+          "legendFormat": "edge"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15,
+            "pointSize": 3,
+            "axisPlacement": "auto",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "single" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    {
+      "id": 300,
+      "type": "row",
+      "title": "Trading Engine",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "collapsed": false
+    },
+    {
+      "id": 20,
+      "title": "EMA Edge vs Epsilon",
+      "description": "EMA-smoothed edge (must exceed epsilon for state to advance).",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "ncaa_engine_ema_edge",
+          "legendFormat": "ema_edge"
+        },
+        {
+          "expr": "ncaa_engine_epsilon_eff",
+          "legendFormat": "epsilon"
+        },
+        {
+          "expr": "-ncaa_engine_epsilon_eff",
+          "legendFormat": "-epsilon"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 2,
+            "axisPlacement": "auto"
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 21,
+      "title": "Normalised Lead",
+      "description": "Score difference normalised by sigma. Extreme values trigger blowout dead zone.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "ncaa_engine_norm_lead",
+          "legendFormat": "norm_lead"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 2,
+            "axisPlacement": "auto"
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "single" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 22,
+      "title": "Persistence Ticks",
+      "description": "Consecutive same-side ticks. Must reach k_ticks before ARMED.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "targets": [
+        {
+          "expr": "ncaa_engine_persistence_ticks",
+          "legendFormat": "persistence"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "axisPlacement": "auto"
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "single" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    {
+      "id": 400,
+      "type": "row",
+      "title": "Paper Portfolio & PnL",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 },
+      "collapsed": false
+    },
+    {
+      "id": 30,
+      "title": "Open Contracts",
+      "description": "Number of paper contracts currently held.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 29 },
+      "targets": [
+        {
+          "expr": "ncaa_paper_qty",
+          "legendFormat": "qty"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "text", "value": null },
+              { "color": "blue", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 31,
+      "title": "Entry Price",
+      "description": "VWAP entry price for the open position.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 29 },
+      "targets": [
+        {
+          "expr": "ncaa_paper_entry_price",
+          "legendFormat": "entry"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "text", "value": null }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "none", "textMode": "value", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 32,
+      "title": "Realised PnL (USD)",
+      "description": "Cumulative realised profit/loss from closed paper positions.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 29 },
+      "targets": [
+        {
+          "expr": "ncaa_paper_realised_pnl_usd",
+          "legendFormat": "realised"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 33,
+      "title": "Unrealised PnL (USD)",
+      "description": "Mark-to-market unrealised profit/loss on open paper positions.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 29 },
+      "targets": [
+        {
+          "expr": "ncaa_paper_unrealised_pnl_usd",
+          "legendFormat": "unrealised"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": { "graphMode": "area", "textMode": "value_and_sparkline", "colorMode": "value", "justifyMode": "center" }
+    },
+    {
+      "id": 34,
+      "title": "Total PnL Over Time",
+      "description": "Realised + unrealised paper PnL over time.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 34 },
+      "targets": [
+        {
+          "expr": "ncaa_paper_realised_pnl_usd + ncaa_paper_unrealised_pnl_usd",
+          "legendFormat": "total PnL"
+        },
+        {
+          "expr": "ncaa_paper_realised_pnl_usd",
+          "legendFormat": "realised"
+        },
+        {
+          "expr": "ncaa_paper_unrealised_pnl_usd",
+          "legendFormat": "unrealised"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15,
+            "pointSize": 2,
+            "axisPlacement": "auto",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    {
+      "id": 500,
+      "type": "row",
+      "title": "Risk Engine",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "collapsed": false
+    },
+    {
+      "id": 40,
+      "title": "Target vs Actual Qty",
+      "description": "Risk engine target position size (from Beta curve) vs actual held contracts.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 42 },
+      "targets": [
+        {
+          "expr": "ncaa_risk_target_qty",
+          "legendFormat": "target"
+        },
+        {
+          "expr": "ncaa_risk_actual_qty",
+          "legendFormat": "actual"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 2,
+            "axisPlacement": "auto"
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 41,
+      "title": "Curve & News Boost",
+      "description": "Base Beta curve value and news boost multiplier over time.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 42 },
+      "targets": [
+        {
+          "expr": "ncaa_risk_curve_value",
+          "legendFormat": "base_curve"
+        },
+        {
+          "expr": "ncaa_risk_news_boost",
+          "legendFormat": "news_boost"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 2,
+            "axisPlacement": "auto"
+          }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

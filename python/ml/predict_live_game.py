@@ -497,6 +497,11 @@ def _fingerprint(snapshot: dict, payload: dict) -> tuple:
 
 
 def run_live_loop(args, *, stop_on_final: bool = True) -> None:
+    prom_port = getattr(args, "prom_port", 9200)
+    if prom_port:
+        prom_exporter.start(prom_port)
+        print(f"[prom] Prometheus metrics on :{prom_port}/metrics", flush=True)
+
     meta0, pbp0, poly_pf, game_sb = _resolve_from_args(args)
     game_id = meta0.get("gameID")
     if not game_id:
@@ -671,6 +676,8 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
 
             engine_suffix = ""
             risk_suffix = ""
+            tr = None
+            rs = None
             if engine is not None:
                 current_events = demo_all_events[:demo_cursor] if demo_mode else replay_game(pbp)
                 tr = engine.tick(snapshot, payload, result, current_events)
@@ -761,6 +768,16 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
                 f"{engine_suffix}{risk_suffix}",
                 flush=True,
             )
+
+            if prom_port:
+                prom_exporter.update(
+                    snapshot=snapshot,
+                    payload=payload,
+                    result=result,
+                    tick_result=tr,
+                    portfolio=portfolio,
+                    risk_status=rs,
+                )
 
             time.sleep(args.interval_sec)
 

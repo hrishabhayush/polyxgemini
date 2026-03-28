@@ -4,11 +4,14 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/hrishabhayush/polyxgemini/internal/arb"
 	"github.com/hrishabhayush/polyxgemini/internal/budget"
@@ -29,6 +32,15 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 	log.Printf("config loaded from %s", *configPath)
+
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		log.Printf("[metrics] serving Prometheus on :9090/metrics")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			log.Fatalf("metrics server: %v", err)
+		}
+	}()
 
 	wl, err := config.LoadWatchlist(cfg.Polymarket.WatchlistPath)
 	if err != nil {

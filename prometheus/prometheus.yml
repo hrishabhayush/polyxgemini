@@ -8,3 +8,9 @@ scrape_configs:
       - targets: ["host.docker.internal:9090"]
         labels:
           instance: "bot"
+
+  - job_name: "ncaa-ml-live"
+    static_configs:
+      - targets: ["host.docker.internal:9200"]
+        labels:
+          instance: "ml-live"
