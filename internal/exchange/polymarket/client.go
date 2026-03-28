@@ -1,6 +1,7 @@
 package polymarket
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/hmac"
@@ -8,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -73,6 +75,38 @@ func (c *Client) discoverWithLimit(
 		params.Set(k, v)
 	}
 
+	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: build request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gamma: request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gamma: unexpected status %d", resp.StatusCode)
+	}
+
+	var raw []gammaMarketResponse
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("gamma: decode: %w", err)
+	}
+
+	markets := make([]ResolvedMarket, 0, len(raw))
+	for _, m := range raw {
+		rm := toResolvedMarket(m)
+		if rm == nil {
+			continue
+		}
+		markets = append(markets, *rm)
+	}
+	return markets, nil
+}
+
 func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (*exchange.Order, error) {
 	if c.privateKey == nil {
 		return nil, fmt.Errorf("polymarket: private_key not configured — cannot sign orders")
@@ -110,10 +144,8 @@ func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (
 	}
 
 	payload, err := json.Marshal(signedOrder)
-	endpoint := c.cfg.GammaBaseURL + "/markets?" + params.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("gamma: build request: %w", err)
+		return nil, fmt.Errorf("polymarket: marshal order: %w", err)
 	}
 
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
@@ -123,7 +155,7 @@ func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (
 	url := c.cfg.CLOBBaseURL + requestPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("gamma: request: %w", err)
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header["POLY_ADDRESS"] = []string{signerAddr}
@@ -131,26 +163,35 @@ func (c *Client) PlaceOrder(ctx context.Context, order *exchange.OrderRequest) (
 	req.Header["POLY_TIMESTAMP"] = []string{timestamp}
 	req.Header["POLY_API_KEY"] = []string{c.cfg.APIKey}
 	req.Header["POLY_PASSPHRASE"] = []string{c.cfg.Passphrase}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: order request failed: %w", err)
+	}
 	defer resp.Body.Close()
 
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("polymarket: read order response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gamma: unexpected status %d", resp.StatusCode)
+		return nil, fmt.Errorf("polymarket: order returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var raw []gammaMarketResponse
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("gamma: decode: %w", err)
+	var result struct {
+		OrderID   string  `json:"orderID"`
+		Status    string  `json:"status"`
+		FilledQty float64 `json:"filledSize"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("polymarket: decode order response: %w", err)
 	}
 
-	markets := make([]ResolvedMarket, 0, len(raw))
-	for _, m := range raw {
-		rm := toResolvedMarket(m)
-		if rm == nil {
-			continue
-		}
-		markets = append(markets, *rm)
-	}
-	return markets, nil
+	return &exchange.Order{
+		ID:        result.OrderID,
+		Status:    result.Status,
+		FilledQty: result.FilledQty,
+	}, nil
 }
 
 // DiscoverOpenMarkets paginates Gamma with closed=false until it finds target open markets.
@@ -660,9 +701,16 @@ func (c *Client) ResolveMarket(ctx context.Context, slug string) (*ResolvedMarke
 		return nil, fmt.Errorf("no market found for slug: %s", slug)
 	}
 
-	rm := toResolvedMarket(markets[0])
+	m := markets[0]
+	rm := toResolvedMarket(m)
 	if rm == nil {
-		return nil, fmt.Errorf("market %s has malformed token IDs", slug)
+		// Moneyline / team-vs-team markets often use outcome labels other than Yes/No.
+		// If Gamma returns exactly two CLOB tokens, accept the market like ResolveEvent does.
+		var tokenIDs []string
+		if err := json.Unmarshal([]byte(m.ClobTokenIDs), &tokenIDs); err != nil || len(tokenIDs) != 2 {
+			return nil, fmt.Errorf("market %s: need 2 clob token IDs and Yes/No or two-outcome moneyline (gamma parse/outcomes)", slug)
+		}
+		rm = buildResolvedMarket(m, tokenIDs)
 	}
 	return rm, nil
 }
