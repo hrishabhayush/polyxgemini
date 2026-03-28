@@ -2,6 +2,11 @@
 bin/
 *.exe
 *.out
+/bot
+/derivekey
+
+# Cursor / local debug
+.cursor/
 
 # Config with secrets
 config/config.yaml

@@ -4,6 +4,10 @@ polymarket:
   data_base_url: "https://data-api.polymarket.com"
   ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/"
   watchlist_path: "config/markets.yaml"
+  # Order signing (see cmd/derivekey for API credentials). Use config/config.yaml locally (gitignored).
+  wallet_address: "" # funder; omit to use address derived from private_key
+  private_key: "" # hex, optional 0x prefix
+  signature_type: 0 # 0 EOA, 1 Polymarket proxy, 2 Gnosis Safe
   api_key: ""
   api_secret: ""
   passphrase: ""
