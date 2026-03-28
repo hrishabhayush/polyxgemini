@@ -5,6 +5,11 @@
   "timezone": "browser",
   "refresh": "5s",
   "time": { "from": "now-1h", "to": "now" },
+  "links": [
+    { "title": "Operations", "url": "/d/polyxgemini-operations", "type": "link", "icon": "bolt", "tooltip": "System health & WebSocket monitoring" },
+    { "title": "Trading", "url": "/d/polyxgemini-trading", "type": "link", "icon": "graph-bar", "tooltip": "PnL, capital, arbitrage & positions" },
+    { "title": "Confidence Model", "url": "/d/polyxgemini-confidence", "type": "link", "icon": "brain", "tooltip": "ML confidence scores & news sources" }
+  ],
   "templating": {
     "list": [
       {
