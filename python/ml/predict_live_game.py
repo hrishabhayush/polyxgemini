@@ -31,7 +31,7 @@ from in_game_features import (
     compute_snapshot_from_events,
     replay_game,
 )
-from trading_engine import TradingEngine
+from trading_engine import DeadZoneConfig, TradingEngine
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -485,6 +485,18 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
     use_engine = getattr(args, "trade_engine", False)
     engine: TradingEngine | None = None
     if use_engine:
+        dz_cfg = DeadZoneConfig(
+            end_of_quarter_sec=getattr(args, "dz_eoq_sec", 60.0),
+            blowout_q1=getattr(args, "dz_blowout_q1", 10),
+            blowout_q2=getattr(args, "dz_blowout_q2", 18),
+            foul_count=getattr(args, "dz_foul_count", 3),
+            foul_window_sec=getattr(args, "dz_foul_window_sec", 120.0),
+            foul_proximity_sec=getattr(args, "dz_foul_proximity_sec", 90.0),
+            timeout_gap_sec=getattr(args, "dz_timeout_gap_sec", 90.0),
+            timeout_proximity_sec=getattr(args, "dz_timeout_proximity_sec", 90.0),
+            clean_play_sec=getattr(args, "dz_clean_play_sec", 120.0),
+            clean_play_strict=getattr(args, "dz_clean_play_strict", True),
+        )
         engine = TradingEngine(
             interval_sec=args.interval_sec,
             epsilon_base=getattr(args, "epsilon_base", 0.04),
@@ -494,6 +506,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             ema_span=getattr(args, "ema_span", 25),
             trade_log_path=getattr(args, "trade_log", "data/trade_log.jsonl"),
             min_seconds_between_executes=getattr(args, "trade_interval_sec", None),
+            dead_zone_config=dz_cfg,
         )
 
     engine_label = " | trade_engine=ON" if use_engine else ""
@@ -701,6 +714,30 @@ def main():
         default="data/trade_log.jsonl",
         help="Path for JSON-lines trade log (default: data/trade_log.jsonl)",
     )
+    # Dead zone configuration
+    dz = parser.add_argument_group("dead zone (regime gate) thresholds")
+    dz.add_argument("--dz-eoq-sec", type=float, default=60.0,
+                     help="End-of-quarter dead zone window in seconds (default: 60)")
+    dz.add_argument("--dz-blowout-q1", type=int, default=10,
+                     help="Q1 blowout lead threshold in points (default: 10)")
+    dz.add_argument("--dz-blowout-q2", type=int, default=18,
+                     help="Q2 blowout lead threshold in points (default: 18)")
+    dz.add_argument("--dz-foul-count", type=int, default=3,
+                     help="Foul storm: number of fouls to trigger (default: 3)")
+    dz.add_argument("--dz-foul-window-sec", type=float, default=120.0,
+                     help="Foul storm: sliding window in seconds (default: 120)")
+    dz.add_argument("--dz-foul-proximity-sec", type=float, default=90.0,
+                     help="Foul storm: proximity to current clock (default: 90)")
+    dz.add_argument("--dz-timeout-gap-sec", type=float, default=90.0,
+                     help="Timeout cluster: max gap between back-to-back TOs (default: 90)")
+    dz.add_argument("--dz-timeout-proximity-sec", type=float, default=90.0,
+                     help="Timeout cluster: proximity to current clock (default: 90)")
+    dz.add_argument("--dz-clean-play-sec", type=float, default=120.0,
+                     help="Clean play wait after dead zone clears (default: 120)")
+    dz.add_argument("--dz-clean-play-strict", action="store_true", default=True,
+                     help="Require no fouls/TOs during clean play window (default: true)")
+    dz.add_argument("--no-dz-clean-play-strict", dest="dz_clean_play_strict", action="store_false",
+                     help="Allow elapsed-time-only clean play (disable strict mode)")
     args = parser.parse_args()
 
     if args.trade_interval_sec is not None and args.trade_interval_sec <= 0:
