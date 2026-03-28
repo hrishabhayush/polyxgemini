@@ -31,6 +31,7 @@ from in_game_features import (
     compute_snapshot_from_events,
     replay_game,
 )
+from trading_engine import DeadZoneConfig, TradingEngine
 from paper_portfolio import PaperPortfolio, synthetic_paper_orderbook
 from risk_engine import CurveConfig, RiskEngine
 from trading_engine import TradingEngine
@@ -487,6 +488,18 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
     use_engine = getattr(args, "trade_engine", False)
     engine: TradingEngine | None = None
     if use_engine:
+        dz_cfg = DeadZoneConfig(
+            end_of_quarter_sec=getattr(args, "dz_eoq_sec", 60.0),
+            blowout_q1=getattr(args, "dz_blowout_q1", 10),
+            blowout_q2=getattr(args, "dz_blowout_q2", 18),
+            foul_count=getattr(args, "dz_foul_count", 3),
+            foul_window_sec=getattr(args, "dz_foul_window_sec", 120.0),
+            foul_proximity_sec=getattr(args, "dz_foul_proximity_sec", 90.0),
+            timeout_gap_sec=getattr(args, "dz_timeout_gap_sec", 90.0),
+            timeout_proximity_sec=getattr(args, "dz_timeout_proximity_sec", 90.0),
+            clean_play_sec=getattr(args, "dz_clean_play_sec", 120.0),
+            clean_play_strict=getattr(args, "dz_clean_play_strict", True),
+        )
         engine = TradingEngine(
             interval_sec=args.interval_sec,
             epsilon_base=getattr(args, "epsilon_base", 0.04),
@@ -496,6 +509,7 @@ def run_live_loop(args, *, stop_on_final: bool = True) -> None:
             ema_span=getattr(args, "ema_span", 25),
             trade_log_path=getattr(args, "trade_log", "data/trade_log.jsonl"),
             min_seconds_between_executes=getattr(args, "trade_interval_sec", None),
+            dead_zone_config=dz_cfg,
         )
 
     use_risk = getattr(args, "risk_engine", False)
