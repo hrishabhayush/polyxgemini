@@ -21,6 +21,19 @@ engine:
   min_spread_bps: 50
   max_position_usd: 1000.0
   dry_run: true
+
+hedge:
+  mode: "auto"
+  curve_alpha: 2.0
+  curve_beta: 3.0
+  max_hedge_qty: 15
+  loss_threshold_pct: 0.15
+  mild_loss_threshold_pct: 0.05
+  max_total_exposure: 50.0
+  gemini_half_spread: 0.01
+  rebalance_threshold: 1.0
+  poll_interval_ms: 5000
+  game_duration_min: 40
   ml_server_url: "http://localhost:8766"
   min_edge: 0.05
 

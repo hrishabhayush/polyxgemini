@@ -10,6 +10,7 @@ type Config struct {
 	Polymarket PolymarketConfig `yaml:"polymarket"`
 	Gemini     GeminiConfig     `yaml:"gemini"`
 	Engine     EngineConfig     `yaml:"engine"`
+	Hedge      HedgeConfig      `yaml:"hedge"`
 	Sentiment  SentimentConfig  `yaml:"sentiment"`
 }
 
@@ -53,6 +54,37 @@ type SentimentConfig struct {
 	RedditSubreddits    []string `yaml:"reddit_subreddits"`
 	FinBERTServerURL    string   `yaml:"finbert_server_url"`
 	PollIntervalSec     int      `yaml:"poll_interval_sec"`
+}
+
+type HedgeConfig struct {
+	Mode                 string  `yaml:"mode"`
+	CurveAlpha           float64 `yaml:"curve_alpha"`
+	CurveBeta            float64 `yaml:"curve_beta"`
+	MaxHedgeQty          float64 `yaml:"max_hedge_qty"`
+	LossThresholdPct     float64 `yaml:"loss_threshold_pct"`
+	MildLossThresholdPct float64 `yaml:"mild_loss_threshold_pct"`
+	MaxTotalExposure     float64 `yaml:"max_total_exposure"`
+	GeminiHalfSpread     float64 `yaml:"gemini_half_spread"`
+	RebalanceThreshold   float64 `yaml:"rebalance_threshold"`
+	PollIntervalMS       int     `yaml:"poll_interval_ms"`
+	GameDurationMin      int     `yaml:"game_duration_min"` // fallback game duration (default 40)
+}
+
+// MarketPair is a resolved pair from markets.yaml for hedge monitor use.
+type MarketPair struct {
+	Name           string
+	PolymarketSlug string
+	GeminiTicker   string
+	GeminiSymbols  []string // resolved instrument symbols
+}
+
+// LoadMarketPairs loads pairs from markets.yaml and returns them.
+func LoadMarketPairs(path string) ([]PairEntry, error) {
+	wl, err := LoadWatchlist(path)
+	if err != nil {
+		return nil, err
+	}
+	return wl.Pairs, nil
 }
 
 func Load(path string) (*Config, error) {
