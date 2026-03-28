@@ -253,3 +253,75 @@ var FillRate = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name:      "fill_rate",
 	Help:      "Ratio of filled orders to placed orders (0-1).",
 }, []string{"exchange"})
+
+// ---- Hedge Layer ----
+
+var HedgeTNorm = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "t_norm",
+	Help:      "Normalised game time [0,1] used by the hedge monitor.",
+})
+
+var HedgeCurveValue = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "curve_value",
+	Help:      "Current Gemini Beta curve value [0,1].",
+})
+
+var HedgeTargetQty = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "target_qty",
+	Help:      "Desired Gemini hedge contract count from curve.",
+})
+
+var HedgeGeminiQty = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "gemini_qty",
+	Help:      "Actual Gemini paper portfolio contract count.",
+})
+
+var HedgeGeminiRealised = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "gemini_realised_pnl",
+	Help:      "Gemini paper portfolio cumulative realised PnL.",
+})
+
+var HedgeGeminiUnrealised = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "gemini_unrealised_pnl",
+	Help:      "Gemini paper portfolio mark-to-market unrealised PnL.",
+})
+
+var HedgeCombinedPnL = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "combined_pnl",
+	Help:      "Total PnL across Poly + Gemini positions.",
+})
+
+var HedgePolyPnL = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "poly_pnl",
+	Help:      "Polymarket unrealised PnL tracked by hedge monitor.",
+})
+
+var HedgeNewsActive = promauto.NewGauge(prometheus.GaugeOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "news_active",
+	Help:      "Whether a news event has been detected (1=yes, 0=no).",
+})
+
+var HedgeActionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "polyxgemini",
+	Subsystem: "hedge",
+	Name:      "actions_total",
+	Help:      "Total hedge actions taken by type.",
+}, []string{"action"})
